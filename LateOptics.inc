@@ -21,9 +21,9 @@ void hdrRender(RE::ImageSpaceEffect* effect,RE::BSTriShape* shape,RE::ImageSpace
         if(opticalBuffers.prepared==frame&&opticalBuffers.draws&&opticalBuffers.composed!=frame){
             // Replay reports copies/draws itself; do not count them twice.
             if(opticalBuffers.compose(frame,mainScene)){
-            static unsigned reported=0;static double nextReport=0;double time=now();
-            if(reported++<3||(dblui::Enabled()&&time>=nextReport)){
-                nextReport=time+5;
+            static double nextReport=0;
+            if(dblui::Enabled()&&now()>=nextReport){
+                nextReport=now()+5;
                 SKSE::log::info("[DBL-optical-path] mode={} frame={} bottle_draws={} shared_scene_snapshots={} before_HDR=true capture={} native_buffer_transfers={} borrowed_depth={}",
                     forwardDraws.enabled?"forward":"optical-buffers",frame,opticalBuffers.draws,forwardDraws.enabled?1:0,
                     forwardDraws.lastPacked?"packed":"legacy",forwardDraws.lastTransfers,forwardDraws.snapshot.usingNativeDepth);

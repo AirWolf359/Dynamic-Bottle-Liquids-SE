@@ -728,9 +728,9 @@ float4 PSMain(Pixel p) : SV_TARGET {
     if(discriminant>0&&effectWeight(19)>0) {
         float nearT=max(0,-b-sqrt(discriminant)); float farT=-b+sqrt(discriminant);
         int steps=staticLOD?12:colorTraceSteps(p,sphere),first,last;
-        // Keep the original constant reciprocal on the full-quality path.
+        steps=(steps+1)/2;
         float span=max(0,farT-nearT);
-        float stepSize=steps==96?span/96:span/steps;
+        float stepSize=span/steps;
         traceRange(p.localEye,dir,nearT,farT,steps,first,last);
         float3 previous=p.localEye+dir*(nearT+first*stepSize);
         int colorSegment=0;float4 colorEndpoints=0;

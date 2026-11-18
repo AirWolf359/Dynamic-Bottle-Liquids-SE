@@ -46,7 +46,7 @@ struct ForwardBindings {
 #include "ForwardCapture.inc"
 struct ForwardDraws {
     static constexpr UINT bottleStride=((sizeof(GPU)+255)/256)*256,bottlesPerUpload=65536/bottleStride;
-    struct Record {ForwardBindings state;ComPtr<ID3D11Buffer> copies[7],singleUpload,strictCopy;GPU bottleData{};bool upload=false;UINT count{},start{};INT base{};};
+    struct Record {std::string profileName;uintptr_t instance=0;ForwardBindings state;ComPtr<ID3D11Buffer> copies[7],singleUpload,strictCopy;GPU bottleData{};bool upload=false;UINT count{},start{};INT base{};};
     std::vector<Record> records;size_t used=0;
     std::vector<ComPtr<ID3D11Buffer>> uploads;
     ForwardCapture packing;bool optimized=true,packed=false;
@@ -55,8 +55,9 @@ struct ForwardDraws {
     ComPtr<ID3D11PixelShader> shader;
     SceneSnapshot snapshot;
     bool enabled=false,borrowSceneDepth=true;
-    void capture(ID3D11DeviceContext* c,UINT count,UINT start,INT base,const GPU* bottleData=nullptr,ForwardBindings* captured=nullptr){
+    void capture(ID3D11DeviceContext* c,UINT count,UINT start,INT base,const GPU* bottleData=nullptr,ForwardBindings* captured=nullptr,const char* name=nullptr,uintptr_t instance=0){
         if(used==records.size())records.emplace_back();auto& r=records[used];
+        r.instance=0;if(dblui::Extensive()&&name){r.profileName=name;r.instance=instance;}
         if(cachedContext.Get()!=c){cachedContext=c;device.Reset();extended.Reset();c->GetDevice(&device);c->QueryInterface(IID_PPV_ARGS(&extended));}
         if(captured)r.state=std::move(*captured);else r.state.read(c,extended.Get(),optimized&&bottleData);
         bool csActive=r.state.csStrict&&communityLighting.capture(c);
@@ -129,7 +130,7 @@ struct ForwardDraws {
         dblui::GPUCost passTiming(c,dblui::GPUStage::Draw,!detailed&&used!=0);
         for(size_t i=0;i<used;++i){
             const auto& r=records[i];r.state.bind(c,optimized&&i?&records[i-1].state:nullptr,true);
-            dblui::GPUCost timing(c,dblui::GPUStage::Draw,detailed);original(c,r.count,r.start,r.base);
+            dblui::GPUCost timing(c,dblui::GPUStage::Draw,detailed);dblui::LabelDraw(timing.token,r.profileName.c_str(),r.instance);original(c,r.count,r.start,r.base);
         }
     }
 } forwardDraws;

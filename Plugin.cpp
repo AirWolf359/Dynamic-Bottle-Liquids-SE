@@ -120,8 +120,9 @@ void BeginBubbleFrame(ID3D11DeviceContext* ctx){
     UINT count=1;D3D11_VIEWPORT viewport{};ctx->RSGetViewports(&count,&viewport);
     float fov=75;if(auto* camera=RE::PlayerCamera::GetSingleton())if(std::isfinite(camera->worldFOV)&&camera->worldFOV>1&&camera->worldFOV<179)fov=camera->worldFOV;
     bubblePixelScale=count==1?viewport.Width/(2*std::tan(fov*.00872664626f)):1024;
+    if(!dblui::Extensive())return;
     static double nextReport=0;auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    if(dblui::Extensive()&&seconds>=nextReport){nextReport=seconds+5;unsigned reserved=0,live=0,packed=0;
+    if(seconds>=nextReport){nextReport=seconds+5;unsigned reserved=0,live=0,packed=0;
         for(auto& [g,i]:instances){reserved+=i.bubbleQuota.Total();live+=unsigned(i.motion.shaking.size()+i.motion.surfaceBubbles.size()+i.motion.bubbles.size());packed+=unsigned(i.constants.bubbleCount);}
         SKSE::log::info("[DBL-bubble-budget] maximum=1280 reserved={} retained={} cached={} tracked={}",reserved,live,packed,instances.size());
     }
@@ -443,7 +444,7 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     float simulationWeight=distanceTuning.Weight(20,lodDistance);
     effectWeights[5]*=simulationWeight;effectWeights[6]*=simulationWeight;effectWeight*=simulationWeight;
     if(!distanceTuning.simulation)effectWeight=0;
-    if(inst.metricsFrame!=frame){inst.metricsFrame=frame;dblui::AddTier(!distanceTuning.simulation||effectWeight==0?4:lodDistance>512?3:lodDistance<=192?0:lodDistance<=384?1:2);}
+    if(dblui::Extensive()&&inst.metricsFrame!=frame){inst.metricsFrame=frame;dblui::AddTier(!distanceTuning.simulation||effectWeight==0?4:lodDistance>512?3:lodDistance<=192?0:lodDistance<=384?1:2);}
     bool outsideSimulation=distanceTuning.simulation&&lodDistance>512;
     bool resuming=inst.suspended&&!outsideSimulation;
     if(outsideSimulation){
@@ -478,14 +479,14 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         if(tick){
         inst.motion.restWorldThreshold=.1f;inst.motion.worldScale=t.scale;
         float simulationDt=inst.schedule.Consume();
-        if(simulationDt>0)dblui::AddScheduled(lodDistance<=192?0:lodDistance<=384?1:2);
+        if(dblui::Extensive()&&simulationDt>0)dblui::AddScheduled(lodDistance<=192?0:lodDistance<=384?1:2);
         inst.previous=inst.constants;inst.previousClock=inst.motion.time;
         nuka::SimulationTimings timings{};
         auto cacheHits=inst.motion.sectionHits,cacheBuilds=inst.motion.sectionBuilds;
         int steps=simulationDt<=dt?1:std::max(1,int(std::ceil(simulationDt/.05f)));
         for(int step=0;step<steps;++step){nuka::SimulationTimings part{};
             inst.constants=nuka::Simulate(profile->settings,inst.motion,acceleration,up,simulationDt/steps,true,false,1.f,dblui::Extensive()?&part:nullptr);
-            for(unsigned k=0;k<7;++k)timings[k]+=part[k];
+            if(dblui::Extensive())for(unsigned k=0;k<7;++k)timings[k]+=part[k];
         }
         if(inst.schedule.interval==0||dt==0){inst.previous=inst.constants;inst.previousClock=inst.motion.time;}
         dblui::AddSection(inst.motion.sectionHits-cacheHits,inst.motion.sectionBuilds-cacheBuilds,inst.motion.section.area,inst.motion.section.depth);
@@ -565,7 +566,7 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     if(lateDraw&&forwardDraws.enabled&&forwardDraws.optimized){
         // No temporary graphics-state substitution and no extra copy of our own
         // constant buffer. Capture native bindings before touching the pipeline.
-        forwardDraws.capture(ctx,count,start,base,&gpu,captured?&native:nullptr);++opticalBuffers.draws;return true;
+        forwardDraws.capture(ctx,count,start,base,&gpu,captured?&native:nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));++opticalBuffers.draws;return true;
     }
     D3D11_MAPPED_SUBRESOURCE map{}; if(FAILED(ctx->Map(buffer.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&map)))return false;
     memcpy(map.pData,&gpu,sizeof(gpu));ctx->Unmap(buffer.Get(),0);
@@ -589,8 +590,8 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     RippleTexture::Binding rippleBinding(ctx,rippleTexture);
     NativeGlassBinding nativeGlassBinding(ctx);
     if(profile->nativeGlassPrototype)nativeGlassBinding.Bind(nativeLiquid.Get());
-    if(lateDraw)opticalBuffers.produce(ctx,oldDraw,count,start,base);
-    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);oldDraw(ctx,count,start,base);}
+    if(lateDraw)opticalBuffers.produce(ctx,oldDraw,count,start,base,nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));
+    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,g->name.c_str(),reinterpret_cast<uintptr_t>(g));oldDraw(ctx,count,start,base);}
     if(profile->nativeGlassPrototype)inst.nativeGlassFrame=frame;
     if(gpu.refraction.x&&!lateDraw){auto* blur=oldBlur.Get();ctx->PSSetShaderResources(12,1,&blur);auto* d=oldSceneDepth.Get();auto* s=oldScene.Get();auto* sampler=oldSceneSampler.Get();ctx->PSSetShaderResources(14,1,&d);ctx->PSSetShaderResources(15,1,&s);ctx->PSSetSamplers(15,1,&sampler);}
     ctx->VSSetShader(ov.Get(),nullptr,0);ctx->PSSetShader(op.Get(),nullptr,0);ctx->IASetInputLayout(ol.Get());
@@ -735,36 +736,26 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 #endif
     SKSE::Init(skse);
     auto path=SKSE::log::log_directory();if(!path)return false;
-    auto sink=std::make_shared<spdlog::sinks::basic_file_sink_mt>((*path/"SkyrimBottlePrototype.log").string(),true);
-    spdlog::set_default_logger(std::make_shared<spdlog::logger>("SkyrimBottlePrototype",sink));spdlog::flush_on(spdlog::level::info);
-    #ifdef DBL_DIAGNOSTIC_DEFAULT_EXTENSIVE
+    auto sink=std::make_shared<spdlog::sinks::basic_file_sink_mt>((*path/"Dynamic Bottle Liquids SE.log").string(),true);
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("Dynamic Bottle Liquids SE",sink));spdlog::flush_on(spdlog::level::info);
+    spdlog::info("Dynamic Bottle Liquids SE 1.0.0 | Skyrim {}",runtime.string());
+    #ifdef DBL_FRAMEWORK_UI
+    // Collection starts only after the framework draws a DBL view.
+    #elif defined(DBL_DIAGNOSTIC_DEFAULT_EXTENSIVE)
     dblui::SetMode(true,false);
 #else
     dblui::SetMode(false,true);
 #endif
     try{ApplyAcceptedSettings(distanceTuning);sharedBlurEnabled=true;loadProfiles();}catch(const std::exception& e){SKSE::log::error("Profile load failed: {}",e.what());return false;}
     if(!SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* m){
+        #ifdef DBL_FRAMEWORK_UI
+        if(m->type==SKSE::MessagingInterface::kDataLoaded)dblui::RegisterFramework();
+#endif
         if(m->type==SKSE::MessagingInterface::kDataLoaded){try{install();ValidateBottleCoverage();}catch(const std::exception& e){SKSE::log::error("Bottle initialization failed: {}",e.what());}}
         if(m->type==SKSE::MessagingInterface::kPreLoadGame||m->type==SKSE::MessagingInterface::kNewGame){instances.clear();bubbleBudgetFrame=~0ull;grabbedBottleRoot.reset();active=nullptr;profile=nullptr;opticalBuffers.reset();}
     })){
         SKSE::log::error("Could not register the SKSE message listener");
         return false;
     }
-    SKSE::log::info("Dynamic Bottle Liquids SE 1.0.0 loaded on Skyrim {}",runtime.string());
     return true;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

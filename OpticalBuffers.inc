@@ -115,13 +115,13 @@ struct OpticalBuffers {
         if(prepared!=currentFrame){{dblui::GPUCost timing(ctx,dblui::GPUStage::Prepare);float zero[4]{};if(!forwardDraws.enabled){ctx->ClearRenderTargetView(light.rt.Get(),zero);ctx->ClearRenderTargetView(transmission.rt.Get(),zero);ctx->ClearRenderTargetView(distortion.rt.Get(),zero);}ctx->ClearDepthStencilView(nearestDS.Get(),D3D11_CLEAR_DEPTH,1,0);}prepared=currentFrame;hdrAttempts=hdrVerified=hdrBoundMismatch=0;draws=0;forwardDraws.clear();producerViewport=vp;}
         info={1,float(width),float(height),4};viewport={0,0,float(width),float(height)};return true;
     }
-    void produce(ID3D11DeviceContext* ctx,DrawFn draw,UINT count,UINT start,INT base,const GPU* bottleData=nullptr){
-        if(forwardDraws.enabled){forwardDraws.capture(ctx,count,start,base,bottleData);++draws;return;}
+    void produce(ID3D11DeviceContext* ctx,DrawFn draw,UINT count,UINT start,INT base,const GPU* bottleData=nullptr,const char* name=nullptr,uintptr_t instance=0){
+        if(forwardDraws.enabled){forwardDraws.capture(ctx,count,start,base,bottleData,nullptr,name,instance);++draws;return;}
         OpticalProducerState saved(ctx);
         ID3D11RenderTargetView* targets[]={light.rt.Get(),transmission.rt.Get(),distortion.rt.Get()};
         ctx->OMSetRenderTargets(3,targets,nearestDS.Get());ctx->PSSetShader(producer.Get(),nullptr,0);
         ctx->OMSetBlendState(opaque.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(nearest.Get(),0);
-        {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);draw(ctx,count,start,base);}++draws;
+        {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,name,instance);draw(ctx,count,start,base);}++draws;
     }
     bool compose(uint64_t currentFrame,ID3D11Resource* verifiedHDRScene=nullptr){
         if(prepared!=currentFrame||!draws||composed==currentFrame||!context)return false;
