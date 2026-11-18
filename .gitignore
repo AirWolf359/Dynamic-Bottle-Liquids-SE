@@ -1,0 +1,3 @@
+build/
+*.cso
+shader-build.json

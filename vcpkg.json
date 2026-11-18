@@ -1,0 +1,1 @@
+{"name":"dynamic-bottle-liquids-se","version":"1.0.0","dependencies":["minhook","nlohmann-json","rapidcsv","spdlog"]}
