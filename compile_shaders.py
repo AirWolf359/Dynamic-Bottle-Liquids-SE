@@ -14,6 +14,8 @@ jobs=[('Bottle','BottleVertex','VSMain','vs_5_0',['DBL_VERTEX']),('Bottle','Bott
 jobs += [('Bottle','BottleNativeLiquid','PSMain','ps_5_0',['DBL_NATIVE_GLASS'])]
 jobs += [('NativeCapture','NativeCaptureCS','main','cs_5_0',['DBL_CS_CAPTURE'])]
 jobs += [('SharedBlur','SharedBlurDown','main','cs_5_0',[]),('SharedBlur','SharedBlurReduce','main','cs_5_0',['DBL_REDUCE'])]
+# Skyrim VR instanced stereo set (VR package only).
+jobs += [('Bottle','BottleVertexVR','VSMain','vs_5_0',['DBL_VERTEX','DBL_VR']),('Bottle','BottleImmediateVR','PSMain','ps_5_0',['DBL_VR']),('Bottle','BottleNativeLiquidVR','PSMain','ps_5_0',['DBL_NATIVE_GLASS','DBL_VR'])]
 def compile_job(job):
     source,name,entry,target,defines=job
     macros=(Macro*(len(defines)+1))(*[Macro(x.encode(),b'1') for x in defines],Macro(None,None))

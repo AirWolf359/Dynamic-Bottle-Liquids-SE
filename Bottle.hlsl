@@ -5,12 +5,33 @@
 #define DBL_DISABLE_TUNED_INTERACTION 1
 #endif
 #ifdef DBL_VERTEX
+#ifdef DBL_VR
+// Skyrim VR instanced stereo: per-eye world and camera matrices, one instance per eye.
+cbuffer NativeFog:register(b0){float4 FogParam:packoffset(c2);float4 FogNearColor:packoffset(c3);float4 FogFarColor:packoffset(c4);};
+cbuffer NativeGeometry : register(b2) { row_major float3x4 WorldEyes[2] : packoffset(c0); };
+cbuffer NativeFrame : register(b12) { row_major float4x4 ViewEyes[2] : packoffset(c0); row_major float4x4 ViewProjEyes[2] : packoffset(c16); };
+cbuffer NativeStereo : register(b13) { float4 StereoInfo : packoffset(c0); float4 EyeClipEdge[2] : packoffset(c1); }; // y: stereo enabled, zw: eye offsets
+#else
 cbuffer NativeFog:register(b0){float4 FogParam:packoffset(c1);float4 FogNearColor:packoffset(c2);float4 FogFarColor:packoffset(c3);};
 cbuffer NativeGeometry : register(b2) { row_major float3x4 World; };
 cbuffer NativeFrame : register(b12) { row_major float3x3 ViewRotation : packoffset(c0); row_major float4x4 ViewProj : packoffset(c8); };
+#endif
 cbuffer NativeUV : register(b1) { float4 TexcoordOffset : packoffset(c2); };
 #else
 cbuffer SceneMaterial : register(b1) { float4 EnvironmentData : packoffset(c2); };
+#ifdef DBL_VR
+// Skyrim VR lighting layout: point-light positions are per eye, [eye*count+i].
+cbuffer SceneLighting : register(b2) {
+    float3 LightDirection : packoffset(c0);
+    float3 LightColor : packoffset(c13);
+    float4 MaterialData : packoffset(c15);
+    row_major float3x4 Ambient : packoffset(c23);
+    float4 LightPositionsEyes[14] : packoffset(c27);
+    float4 LightColors[7] : packoffset(c41);
+    float2 LightCounts : packoffset(c48);
+};
+#define DBL_LIGHT_POSITION(i) LightPositionsEyes[p.eye*(uint)clamp((int)LightCounts.x,0,7)+(i)]
+#else
 cbuffer SceneLighting : register(b2) {
     float3 LightDirection : packoffset(c0);
     float3 LightColor : packoffset(c1);
@@ -20,6 +41,8 @@ cbuffer SceneLighting : register(b2) {
     float4 LightColors[7] : packoffset(c22);
     float2 LightCounts : packoffset(c29);
 };
+#define DBL_LIGHT_POSITION(i) LightPositions[i]
+#endif
 TextureCube<float4> Environment : register(t4);
 SamplerState EnvironmentSampler : register(s4);
 Texture2D<float4> SurfaceBase : register(t0);
@@ -135,9 +158,27 @@ float3 texturedLiquidColor(float3 q,float lod) {
 }
 #endif
 struct Vertex { float4 position : POSITION; float4 normal : NORMAL; float2 uv:TEXCOORD0; float4 tangent:TANGENT; };
-struct Pixel { float4 fog:COLOR1; float4 position : SV_POSITION; float3 local : TEXCOORD0; nointerpolation float3 localEye : TEXCOORD1; float3 world : TEXCOORD2; nointerpolation float3x3 basis : TEXCOORD3; float3 normal : TEXCOORD6; float2 uv:TEXCOORD7; float3 tangent:TEXCOORD8; float3 bitangent:TEXCOORD9; nointerpolation float3x3 viewBasis:TEXCOORD10; nointerpolation float4 clipOrigin:TEXCOORD13; nointerpolation float4 clipX:TEXCOORD14; nointerpolation float4 clipY:TEXCOORD15; nointerpolation float4 clipZ:TEXCOORD16; };
+struct Pixel { float4 fog:COLOR1; float4 position : SV_POSITION; float3 local : TEXCOORD0; nointerpolation float3 localEye : TEXCOORD1; float3 world : TEXCOORD2; nointerpolation float3x3 basis : TEXCOORD3; float3 normal : TEXCOORD6; float2 uv:TEXCOORD7; float3 tangent:TEXCOORD8; float3 bitangent:TEXCOORD9; nointerpolation float3x3 viewBasis:TEXCOORD10; nointerpolation float4 clipOrigin:TEXCOORD13; nointerpolation float4 clipX:TEXCOORD14; nointerpolation float4 clipY:TEXCOORD15; nointerpolation float4 clipZ:TEXCOORD16;
+#ifdef DBL_VR
+    float eyeClip:SV_ClipDistance0; nointerpolation uint eye:TEXCOORD17;
+#endif
+};
+// The region of the target this pixel's view occupies: the whole viewport, or in
+// Skyrim VR the eye's half of the double-wide stereo target. Screen-space
+// lookups clamp to it so they never sample the other eye.
+#ifdef DBL_VR
+#define DBL_EYE_VIEWPORT(p) float4(Viewport.x+Viewport.z*.5*(p).eye,Viewport.y,Viewport.z*.5,Viewport.w)
+#else
+#define DBL_EYE_VIEWPORT(p) Viewport
+#endif
 #ifdef DBL_VERTEX
+#ifdef DBL_VR
+Pixel VSMain(Vertex v,uint instance:SV_InstanceID) {
+    const uint eye=StereoInfo.y!=0?(instance&1):0;
+    const float3x4 World=WorldEyes[eye];const float4x4 ViewProj=ViewProjEyes[eye];const float3x3 ViewRotation=(float3x3)ViewEyes[eye];
+#else
 Pixel VSMain(Vertex v) {
+#endif
     Pixel o; o.local=v.position.xyz; o.normal=v.normal.xyz*2-1;
     o.uv=v.uv*TexcoordOffset.zw+TexcoordOffset.xy; o.tangent=float3(v.position.w,v.normal.w*2-1,v.tangent.w*2-1);o.bitangent=v.tangent.xyz*2-1;
     o.position=mul(ViewProj,float4(mul(World,float4(v.position.xyz,1)),1));
@@ -154,6 +195,14 @@ Pixel VSMain(Vertex v) {
     o.localEye=-mul(translation,basis)/max(dot(basis[0],basis[0]),1e-8);
     float f=FogParam.y>0?min(saturate(FogParam.w),pow(saturate(length(o.world)*FogParam.y-FogParam.x),max(FogParam.z,.0001))):0;
     o.fog=float4(lerp(FogNearColor.rgb,FogFarColor.rgb,f),f);
+#ifdef DBL_VR
+    // Same placement as the engine's stereo shaders: the eye's clip edge keeps
+    // each instance in its own half of the double-wide target.
+    const float4 clip=o.position;const bool stereo=StereoInfo.y!=0;
+    o.eyeClip=stereo?dot(clip,EyeClipEdge[eye]):1;
+    o.position.x=(2-StereoInfo.y)*clip.x*.5+(stereo?(eye?StereoInfo.w:StereoInfo.z)*clip.w:0);
+    o.eye=eye;
+#endif
     return o;
 }
 #else
@@ -414,7 +463,7 @@ int colorTraceSteps(Pixel p,float sphere){
 #ifdef DBL_FULL_TRACE
     return 96;
 #else
-    if(BubbleInfo.z<=0 || Viewport.z<=0 || Viewport.w<=0)return 96;
+    if(BubbleInfo.z<=0 || DBL_EYE_VIEWPORT(p).z<=0 || DBL_EYE_VIEWPORT(p).w<=0)return 96;
     float4 center=p.clipOrigin+p.clipZ*((Bounds.x+Bounds.y)*.5);
     float wRadius=sphere*length(float3(p.clipX.w,p.clipY.w,p.clipZ.w));
     float nearW=abs(center.w)-wRadius;
@@ -422,7 +471,7 @@ int colorTraceSteps(Pixel p,float sphere){
     float2 centerNdc=abs(center.xy/center.w);
     float2 extent=sphere*float2(length(float3(p.clipX.x,p.clipY.x,p.clipZ.x)),
         length(float3(p.clipX.y,p.clipY.y,p.clipZ.y)))+centerNdc*wRadius;
-    float projected=max(Viewport.z*extent.x,Viewport.w*extent.y)/nearW;
+    float projected=max(DBL_EYE_VIEWPORT(p).z*extent.x,DBL_EYE_VIEWPORT(p).w*extent.y)/nearW;
     // Same small/full thresholds as Fallout, but gradual integer steps instead
     // of 48/72/96 tier jumps. No opacity, wave amplitude or lens fade.
     if(projected<48)return (int)round(lerp(24,48,smoothstep(12,48,projected)));
@@ -915,7 +964,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
             CSLight csLight=(CSLight)0;
             float4 lightPosition;float3 incidentColor;
             if(useCS){if(!csLightAt(i,cluster.x,csLight))continue;lightPosition=csLight.positionWS;lightPosition.w=csLight.radius;incidentColor=csLightColor(csLight);}
-            else {lightPosition=LightPositions[i];incidentColor=max(0,LightColors[i].rgb);}
+            else {lightPosition=DBL_LIGHT_POSITION(i);incidentColor=max(0,LightColors[i].rgb);}
             float3 delta=lightPosition.xyz-lightingPosition;
             float distance=length(delta); float3 direction=delta/max(distance,.0001);
             float attenuation=useCS?csAttenuation(distance,csLight):1-pow(saturate(distance/max(lightPosition.w,.0001)),2);
@@ -1037,8 +1086,8 @@ float4 PSMain(Pixel p) : SV_TARGET {
             if(clip.w*currentClip.w>0&&abs(clip.w)>1e-6&&all(abs(ndcPerPixel)>1e-8)){
                 float2 lensPixels=(clip.xy/clip.w-currentNdc)/ndcPerPixel;
                 float2 projected=p.position.xy+(clip.xy/clip.w-currentNdc)/ndcPerPixel;
-                float edge=min(min(projected.x-Viewport.x,projected.y-Viewport.y),
-                    min(Viewport.x+Viewport.z-projected.x,Viewport.y+Viewport.w-projected.y));
+                float edge=min(min(projected.x-DBL_EYE_VIEWPORT(p).x,projected.y-DBL_EYE_VIEWPORT(p).y),
+                    min(DBL_EYE_VIEWPORT(p).x+DBL_EYE_VIEWPORT(p).z-projected.x,DBL_EYE_VIEWPORT(p).y+DBL_EYE_VIEWPORT(p).w-projected.y));
                 screenWeight=smoothstep(0,.2,dot(outgoing,forward));
                 if(reflected)screenWeight*=smoothstep(0,8,edge);
 #if DBL_REFRACTION_DIAGNOSTIC
@@ -1048,7 +1097,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
                 // A small fixed pixel cap destroys the lens's negative image
                 // slope. Bound pathological projections by viewport extent,
                 // leaving normal bottle-scale inversion intact.
-                shift+=clamp(lensPixels,-Viewport.zw*.5,Viewport.zw*.5)*fade*saturate(Refraction.w/4)*detailLOD;
+                shift+=clamp(lensPixels,-DBL_EYE_VIEWPORT(p).zw*.5,DBL_EYE_VIEWPORT(p).zw*.5)*fade*saturate(Refraction.w/4)*detailLOD;
             }
         }
         if(reflected && GlassColor.w>=2){
@@ -1066,7 +1115,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
 #ifdef DBL_ENV_PATH_TEST
         return float4(environmentWeight,alpha,0,1);
 #endif
-        float2 target=clamp(p.position.xy+shift,Viewport.xy+.5,Viewport.xy+Viewport.zw-.5);
+        float2 target=clamp(p.position.xy+shift,DBL_EYE_VIEWPORT(p).xy+.5,DBL_EYE_VIEWPORT(p).xy+DBL_EYE_VIEWPORT(p).zw-.5);
         #ifdef DBL_OPTICAL
         float3 tint=lerp(float3(1,1,1),float3(1,.28,.38),1-exp(-lengthWet*.10));
         // Reallocate the same attenuated image weight; do not add a second
@@ -1079,7 +1128,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
         // Reject all four bilinear footprint taps if any belongs to foreground.
         int2 corner=int2(floor(target-.5));bool foreground=false;
         [unroll]for(int y=0;y<2;y++)[unroll]for(int x=0;x<2;x++){
-            int2 pixel=clamp(corner+int2(x,y),int2(Viewport.xy),int2(Viewport.xy+Viewport.zw)-1);
+            int2 pixel=clamp(corner+int2(x,y),int2(DBL_EYE_VIEWPORT(p).xy),int2(DBL_EYE_VIEWPORT(p).xy+DBL_EYE_VIEWPORT(p).zw)-1);
             foreground=foreground||(SceneDepth.Load(int3(pixel,0))<p.position.z-1e-5);
         }
         if(foreground)target=p.position.xy;

@@ -5,6 +5,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <MinHook.h>
+#include <intrin.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include "Simulation.h"
 #include "BubbleMotion.h"
@@ -77,6 +78,11 @@ void AllocateBubbleQuotas(uint64_t currentFrame){
 DistanceTuning distanceTuning;
 
 uint64_t frame=0;
+#ifdef DBL_SKYRIM_VR
+constexpr bool vrStereo=true;  // Skyrim VR instanced stereo build
+#else
+constexpr bool vrStereo=false;
+#endif
 thread_local RE::BSRenderPass* active=nullptr;
 thread_local Profile* profile=nullptr;
 using GeometryFn=void(*)(RE::BSShader*,RE::BSRenderPass*,uint32_t);
@@ -119,7 +125,8 @@ void BeginBubbleFrame(ID3D11DeviceContext* ctx){
     grabbedBottleRoot.reset();if(auto* player=RE::PlayerCharacter::GetSingleton())if(auto grabbed=player->GetGrabbedRef())grabbedBottleRoot.reset(grabbed->Get3D());
     UINT count=1;D3D11_VIEWPORT viewport{};ctx->RSGetViewports(&count,&viewport);
     float fov=75;if(auto* camera=RE::PlayerCamera::GetSingleton())if(float worldFOV=camera->GetRuntimeData().worldFOV;std::isfinite(worldFOV)&&worldFOV>1&&worldFOV<179)fov=worldFOV;
-    bubblePixelScale=count==1?viewport.Width/(2*std::tan(fov*.00872664626f)):1024;
+    // VR draws both eyes side by side in one viewport; each eye gets half the width.
+    bubblePixelScale=count==1?viewport.Width*(vrStereo?.5f:1.f)/(2*std::tan(fov*.00872664626f)):1024;
     if(!dblui::Extensive())return;
     static double nextReport=0;auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if(seconds>=nextReport){nextReport=seconds+5;unsigned reserved=0,live=0,packed=0;
@@ -276,13 +283,13 @@ void initialize(ID3D11Device* device,const std::filesystem::path& shaderPath=roo
     rippleTexture.Create(device);
     ComPtr<ID3DBlob> v,p,e;
     auto compile=[&](const char* entry,const char* target,ComPtr<ID3DBlob>& code) {
-        auto file=shaderPath.parent_path()/(target[0]=='v'?"BottleVertex.cso":"BottleImmediate.cso");
+        auto file=shaderPath.parent_path()/(std::string(target[0]=='v'?"BottleVertex":"BottleImmediate")+(vrStereo?"VR.cso":".cso"));
         if(FAILED(D3DReadFileToBlob(file.c_str(),&code)))throw std::runtime_error("Missing precompiled bottle shader: "+file.string());
     };
     compile("VSMain","vs_5_0",v); compile("PSMain","ps_5_0",p);
     check(device->CreateVertexShader(v->GetBufferPointer(),v->GetBufferSize(),nullptr,&vs));
     check(device->CreatePixelShader(p->GetBufferPointer(),p->GetBufferSize(),nullptr,&ps));
-    ComPtr<ID3DBlob> nativeCode;check(D3DReadFileToBlob((shaderPath.parent_path()/"BottleNativeLiquid.cso").c_str(),&nativeCode));
+    ComPtr<ID3DBlob> nativeCode;check(D3DReadFileToBlob((shaderPath.parent_path()/(vrStereo?"BottleNativeLiquidVR.cso":"BottleNativeLiquid.cso")).c_str(),&nativeCode));
     check(device->CreatePixelShader(nativeCode->GetBufferPointer(),nativeCode->GetBufferSize(),nullptr,&nativeDepthPS));
     D3D11_INPUT_ELEMENT_DESC input[]={
         {"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},
@@ -391,6 +398,17 @@ ComPtr<ID3D11ShaderResourceView> NativeLiquidTexture(RE::BSGeometry* glass){
     }
     return {};
 }
+// Skyrim VR draws bottles with DrawIndexedInstanced, one instance per eye. The
+// renderer submits through DrawFn, so during an instanced bottle draw every
+// native submission, including DBL's own liquid draw, keeps the same instancing.
+using DrawInstancedFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT,UINT,INT,UINT);
+struct InstancedCall{DrawInstancedFn original;UINT instances,startInstance;};
+thread_local const InstancedCall* instancedCall=nullptr;
+void STDMETHODCALLTYPE InstancedShim(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
+    instancedCall->original(ctx,count,instancedCall->instances,start,base,instancedCall->startInstance);
+}
+DrawFn NativeDraw(){return instancedCall?&InstancedShim:oldDraw;}
+void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original);
 bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder) {
     if(!distanceTuning.renderer||!active||!profile)return false;
     if(!vs||count!=profile->indices){return false;}
@@ -559,7 +577,10 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         // Empty pixels alpha-blend away. No captured glass/background is
         // sampled, so the native shell cannot be refracted or fogged twice.
         gpu.refraction={};
-    }else try{if(profile->nativeGlassPrototype)sceneSnapshot.captureShared(ctx,frame,gpu.refraction,gpu.viewport);else sceneSnapshot.capture(ctx,gpu.refraction,gpu.viewport);}catch(const std::exception& e){gpu.refraction={};sceneSnapshot.status=e.what();}
+    }else try{
+        // VR: one shared snapshot per frame. A per-bottle copy of the double-wide
+        // stereo target is too costly; the shader clamps lookups to each eye's half.
+        if(profile->nativeGlassPrototype||vrStereo)sceneSnapshot.captureShared(ctx,frame,gpu.refraction,gpu.viewport);else sceneSnapshot.capture(ctx,gpu.refraction,gpu.viewport);}catch(const std::exception& e){gpu.refraction={};sceneSnapshot.status=e.what();}
     }
     if(profile->nativeGlassPrototype&&captured&&native.csStrict&&communityLighting.liveBindingsReady(ctx))gpu.eye.w=float(unsigned(gpu.eye.w)|4u);
     detailTimer.Switch(dblui::BottleStage::Upload);
@@ -579,7 +600,7 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     // Split direct liquid draws in two-sided native glass.
     // Submit the rear shell with its untouched engine bindings before liquid.
     const bool writeLiquidDepth=profile->directNativeLiquid&&profile->liquidAlphaOverride==1.f&&profile->nativeLiquidDepth&&effectWeights[19]>0;
-    if(profile->directNativeLiquid&&!writeLiquidDepth&&effectWeights[19]>0)glassOrder.Begin(ctx,oldDraw,count,start,base);
+    if(profile->directNativeLiquid&&!writeLiquidDepth&&effectWeights[19]>0)glassOrder.Begin(ctx,NativeDraw(),count,start,base);
     ComPtr<ID3D11ShaderResourceView> oldScene,oldSceneDepth,oldBlur;ComPtr<ID3D11SamplerState> oldSceneSampler;
     if(gpu.refraction.x&&!lateDraw){ctx->PSGetShaderResources(12,1,&oldBlur);ctx->PSGetShaderResources(14,1,&oldSceneDepth);ctx->PSGetShaderResources(15,1,&oldScene);ctx->PSGetSamplers(15,1,&oldSceneSampler);}
     if(gpu.refraction.x&&!lateDraw){auto* blur=sceneSnapshot.blur.view();ctx->PSSetShaderResources(12,1,&blur);auto* d=sceneSnapshot.depthView.Get();auto* s=sceneSnapshot.colorView.Get();auto* sampler=sceneSnapshot.sampler.Get();ctx->PSSetShaderResources(14,1,&d);ctx->PSSetShaderResources(15,1,&s);ctx->PSSetSamplers(15,1,&sampler);}
@@ -590,8 +611,8 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     RippleTexture::Binding rippleBinding(ctx,rippleTexture);
     NativeGlassBinding nativeGlassBinding(ctx);
     if(profile->nativeGlassPrototype)nativeGlassBinding.Bind(nativeLiquid.Get());
-    if(lateDraw)opticalBuffers.produce(ctx,oldDraw,count,start,base,nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));
-    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,g->name.c_str(),reinterpret_cast<uintptr_t>(g));oldDraw(ctx,count,start,base);}
+    if(lateDraw)opticalBuffers.produce(ctx,NativeDraw(),count,start,base,nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));
+    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,g->name.c_str(),reinterpret_cast<uintptr_t>(g));NativeDraw()(ctx,count,start,base);}
     if(profile->nativeGlassPrototype)inst.nativeGlassFrame=frame;
     if(gpu.refraction.x&&!lateDraw){auto* blur=oldBlur.Get();ctx->PSSetShaderResources(12,1,&blur);auto* d=oldSceneDepth.Get();auto* s=oldScene.Get();auto* sampler=oldSceneSampler.Get();ctx->PSSetShaderResources(14,1,&d);ctx->PSSetShaderResources(15,1,&s);ctx->PSSetSamplers(15,1,&sampler);}
     ctx->VSSetShader(ov.Get(),nullptr,0);ctx->PSSetShader(op.Get(),nullptr,0);ctx->IASetInputLayout(ol.Get());
@@ -599,11 +620,11 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     static uint64_t draws=0;if(++draws==1||draws==120)SKSE::log::info("Liquid rendered: {} frame={} plane=({},{},{},{})",g->name.c_str(),frame,gpu.plane.x,gpu.plane.y,gpu.plane.z,gpu.plane.w);
     return true;
 }
+#include "VRDiagnostics.inc"
 __declspec(noinline) bool TryRenderBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder){
     try{return render(ctx,count,start,base,glassOrder);}catch(const std::exception& e){SKSE::log::error("Bottle render skipped: {}",e.what());return false;}
 }
-__declspec(noinline) void STDMETHODCALLTYPE draw(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base) {
-
+__forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
     bool handled=false;NativeGlassOrder glassOrder;
     {
         // Keep every rejection timed, but avoid entering the large renderer
@@ -613,14 +634,27 @@ __declspec(noinline) void STDMETHODCALLTYPE draw(ID3D11DeviceContext* ctx,UINT c
             handled=TryRenderBottle(ctx,count,start,base,glassOrder);
         }
     }
-    if(glassOrder.active)glassOrder.Finish(oldDraw,count,start,base);
-    else if(!handled||(profile&&profile->nativeGlassPrototype))oldDraw(ctx,count,start,base);
-
+    if(glassOrder.active)glassOrder.Finish(NativeDraw(),count,start,base);
+    else if(!handled||(profile&&profile->nativeGlassPrototype))NativeDraw()(ctx,count,start,base);
+}
+__declspec(noinline) void STDMETHODCALLTYPE draw(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base) {
+    if(vrDiagnostics.enabled){
+        vrDiagnostics.Observe(ctx,VRDiagnostics::kDrawIndexed,count,1,_ReturnAddress());
+        oldDraw(ctx,count,start,base);return;
+    }
+    DrawBottle(ctx,count,start,base);
+}
+void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original){
+    const InstancedCall* previous=instancedCall;
+    const InstancedCall call{original,instances,startInstance};instancedCall=&call;
+    DrawBottle(ctx,count,start,base);
+    instancedCall=previous;
 }
 HRESULT STDMETHODCALLTYPE present(IDXGISwapChain* s,UINT interval,UINT flags) {
     auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
-    if(!renderer||!IsGamePresentation(s,reinterpret_cast<IDXGISwapChain*>(renderer->renderWindows[0].swapChain),flags))
-        return oldPresent(s,interval,flags);
+    const bool game=renderer&&IsGamePresentation(s,reinterpret_cast<IDXGISwapChain*>(renderer->renderWindows[0].swapChain),flags);
+    if(vrDiagnostics.enabled)vrDiagnostics.Present(game);
+    if(!game)return oldPresent(s,interval,flags);
     if(frame==1)SKSE::log::info("Present hook active");
     {dblui::CPUCost housekeeping(dblui::CPUStage::Housekeeping);
     if(opticalBuffers.finishFrame(frame)){
@@ -639,11 +673,11 @@ void setup(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags) {
     dblui::CPUCost hooks(dblui::CPUStage::Hooks);
     if(!pass||!pass->geometry)return;
     profile=FindBottleProfile(profiles,pass->geometry->name.c_str());
-    if(profile)active=pass;
-
+    if(profile){active=pass;if(vrDiagnostics.enabled)vrDiagnostics.Setup(pass);}
 
 }
 void restore(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags) {
+    if(vrDiagnostics.enabled&&active)vrDiagnostics.Restore(active);
     active=nullptr;profile=nullptr;oldRestore(shader,pass,flags);
 }
 void install() {
@@ -661,6 +695,14 @@ void install() {
     auto presentStatus=drawStatus==MH_OK?MH_EnableHook(presentTarget):MH_UNKNOWN;
     SKSE::log::info("Hook activation: DrawIndexed={} Present={}",MH_StatusToString(drawStatus),MH_StatusToString(presentStatus));
     if(drawStatus!=MH_OK||presentStatus!=MH_OK){MH_DisableHook(drawTarget);MH_DisableHook(presentTarget);throw std::runtime_error("Hook activation failed; see individual statuses above");}
+    if constexpr(vrStereo){
+        // Immediate path only: the late optical composition assumes one view and
+        // is not ported to stereo yet.
+        forwardDraws.enabled=false;distanceTuning.optical=false;
+        SKSE::log::info("[DBL-VR] Skyrim VR stereo rendering: immediate path with shared-snapshot refraction; late composition off");
+        vrDiagnostics.Install(reinterpret_cast<ID3D11Device*>(data->forwarder),vtable);
+        vrDiagnostics.enabled=true;
+    }
     REL::Relocation<uintptr_t> vt{RE::VTABLE_BSLightingShader[0]};
     oldSetup=reinterpret_cast<GeometryFn>(vt.write_vfunc(6,&setup));oldRestore=reinterpret_cast<GeometryFn>(vt.write_vfunc(7,&restore));
     installHDRProbe();
