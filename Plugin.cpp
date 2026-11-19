@@ -118,7 +118,7 @@ void BeginBubbleFrame(ID3D11DeviceContext* ctx){
     if(bubbleBudgetFrame==frame)return;bubbleBudgetFrame=frame;AllocateBubbleQuotas(frame);
     grabbedBottleRoot.reset();if(auto* player=RE::PlayerCharacter::GetSingleton())if(auto grabbed=player->GetGrabbedRef())grabbedBottleRoot.reset(grabbed->Get3D());
     UINT count=1;D3D11_VIEWPORT viewport{};ctx->RSGetViewports(&count,&viewport);
-    float fov=75;if(auto* camera=RE::PlayerCamera::GetSingleton())if(std::isfinite(camera->worldFOV)&&camera->worldFOV>1&&camera->worldFOV<179)fov=camera->worldFOV;
+    float fov=75;if(auto* camera=RE::PlayerCamera::GetSingleton())if(float worldFOV=camera->GetRuntimeData().worldFOV;std::isfinite(worldFOV)&&worldFOV>1&&worldFOV<179)fov=worldFOV;
     bubblePixelScale=count==1?viewport.Width/(2*std::tan(fov*.00872664626f)):1024;
     if(!dblui::Extensive())return;
     static double nextReport=0;auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -375,7 +375,7 @@ RE::BSLightingShaderMaterialBase* NativeLiquidMaterial(RE::BSGeometry* glass){
         const std::string_view name=child->name.c_str();
         if(name!="PotionLiquidAnimated"&&name!="DBL_NativeLiquidSource")continue;
         auto* geometry=child->AsGeometry();if(!geometry)continue;
-        auto* property=netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->properties[1].get());
+        auto* property=netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->GetGeometryRuntimeData().properties[1].get());
         if(!property||!property->material)continue;
         auto* material=static_cast<RE::BSLightingShaderMaterialBase*>(property->material);
         return material;
@@ -507,7 +507,7 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     detailTimer.Switch(dblui::BottleStage::State);
     using MaterialFeature=RE::BSShaderMaterial::Feature;
     auto materialFeature=MaterialFeature::kNone;
-    if(auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(g->properties[1].get());prop&&prop->material){
+    if(auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(g->GetGeometryRuntimeData().properties[1].get());prop&&prop->material){
         auto* mat=static_cast<RE::BSLightingShaderMaterialBase*>(prop->material);
         // The draw's default lighting technique supplies model-space constants.
         // A native liquid texture donor does not determine the active technique.
@@ -696,6 +696,16 @@ void ValidateBottleCoverage(){
 }
 }
 constexpr REL::Version releaseVersion{1,0,0,0};
+#ifdef DBL_SKYRIM_VR
+// SKSE VR calls SKSEPlugin_Query and reports 1.4.15.1, so match the runtime family.
+constexpr bool SkyrimVR(REL::Version runtime){return REL::Module::RuntimeFor(runtime)==REL::Module::Runtime::VR;}
+extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse, SKSE::PluginInfo* info) {
+    info->infoVersion=SKSE::PluginInfo::kVersion;
+    info->name="Dynamic Bottle Liquids SE";
+    info->version=releaseVersion.pack();
+    return !skse->IsEditor() && SkyrimVR(skse->RuntimeVersion());
+}
+#else
 #if defined(DBL_STEAM_1597) || defined(DBL_STEAM_UNIFIED)
 constexpr REL::Version steam1597{1,5,97,0};
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse, SKSE::PluginInfo* info) {
@@ -723,9 +733,12 @@ extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Ve
     return v;
 }();
 #endif
+#endif
 extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface* skse) {
     const auto runtime=skse->RuntimeVersion();
-#if defined(DBL_STEAM_UNIFIED)
+#if defined(DBL_SKYRIM_VR)
+    if(!SkyrimVR(runtime))return false;
+#elif defined(DBL_STEAM_UNIFIED)
     if(runtime!=steam1597&&runtime!=steam1170&&runtime!=steam17104)return false;
 #elif defined(DBL_STEAM_1597)
     if(runtime!=steam1597)return false;
