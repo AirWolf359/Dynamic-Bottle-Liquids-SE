@@ -750,7 +750,12 @@ void ValidateBottleCoverage(){
     SKSE::log::info("[DBL-coverage] validated={} missing={} model_conflicts={} expected=303; White Phial series excluded",pending.size(),missing,conflicts);
 }
 }
+#ifdef DBL_SKYRIM_VR
+// VR fork: upstream release (1.0.0) plus the VR build number.
+constexpr REL::Version releaseVersion{1,0,0,1};
+#else
 constexpr REL::Version releaseVersion{1,0,0,0};
+#endif
 #ifdef DBL_SKYRIM_VR
 // SKSE VR calls SKSEPlugin_Query and reports 1.4.15.1, so match the runtime family.
 constexpr bool SkyrimVR(REL::Version runtime){return REL::Module::RuntimeFor(runtime)==REL::Module::Runtime::VR;}
@@ -806,7 +811,11 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
     auto path=SKSE::log::log_directory();if(!path)return false;
     auto sink=std::make_shared<spdlog::sinks::basic_file_sink_mt>((*path/"Dynamic Bottle Liquids SE.log").string(),true);
     spdlog::set_default_logger(std::make_shared<spdlog::logger>("Dynamic Bottle Liquids SE",sink));spdlog::flush_on(spdlog::level::info);
+#ifdef DBL_SKYRIM_VR
+    spdlog::info("Dynamic Bottle Liquids SE VR {} | Skyrim {}",releaseVersion.string("."),runtime.string());
+#else
     spdlog::info("Dynamic Bottle Liquids SE 1.0.0 | Skyrim {}",runtime.string());
+#endif
     #ifdef DBL_FRAMEWORK_UI
     // Collection starts only after the framework draws a DBL view.
     #elif defined(DBL_DIAGNOSTIC_DEFAULT_EXTENSIVE)
