@@ -472,6 +472,9 @@ int colorTraceSteps(Pixel p,float sphere){
     float2 extent=sphere*float2(length(float3(p.clipX.x,p.clipY.x,p.clipZ.x)),
         length(float3(p.clipX.y,p.clipY.y,p.clipZ.y)))+centerNdc*wRadius;
     float projected=max(DBL_EYE_VIEWPORT(p).z*extent.x,DBL_EYE_VIEWPORT(p).w*extent.y)/nearW;
+#ifdef DBL_VR
+    projected*=BubbleInfo.w>0?BubbleInfo.w:1; // VR trace budget scale
+#endif
     // Same small/full thresholds as Fallout, but gradual integer steps instead
     // of 48/72/96 tier jumps. No opacity, wave amplitude or lens fade.
     if(projected<48)return (int)round(lerp(24,48,smoothstep(12,48,projected)));
