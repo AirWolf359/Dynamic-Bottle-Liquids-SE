@@ -184,7 +184,21 @@ template<class T> bool Bind(HMODULE module,T& target,const char* name){
 }
 }
 
+#ifdef DBL_VR_TIMING
+namespace {
+double logWindowSeconds=0,logWindowEnd=0;
+double Seconds(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+}
+void EnableLogTiming(double windowSeconds){
+    logWindowSeconds=windowSeconds;logWindowEnd=0;
+    SetMode(true,false);
+    spdlog::info("[DBL-VR-timing] Log-only timing: detailed summary every {:.0f} s; overlay disabled",windowSeconds);
+}
+#endif
 void RegisterFramework(){
+#ifdef DBL_VR_TIMING
+    if(logWindowSeconds>0)return; // The overlay would switch the timing mode.
+#endif
     if(registered)return;
     auto module=GetModuleHandleW(L"SKSEMenuFramework.dll");
     if(!module)return;
@@ -205,6 +219,22 @@ void RegisterFramework(){
     registered=true;
 }
 void Present(IDXGISwapChain*,unsigned instances,bool){
+#ifdef DBL_VR_TIMING
+    if(logWindowSeconds>0){
+        if(!Enabled())return;
+        trackedBottles=instances;CloseQueryFrame();Poll();
+        static const double ms=[](){LARGE_INTEGER f;QueryPerformanceFrequency(&f);return 1000./f.QuadPart;}();
+        for(unsigned i=0;i<4;++i){costs.CPU(i,cpuClock.ticks[i]*ms);cpuClock.ticks[i]=0;}
+        costs.Seal();
+        const double t=Seconds();
+        if(logWindowEnd==0){Reset();logWindowEnd=t+logWindowSeconds;return;} // Skip startup frames.
+        if(t<logWindowEnd)return;
+        spdlog::info("[DBL-VR-timing] window: {} frames over {:.1f} s",costs.cpuFrames,t-(logWindowEnd-logWindowSeconds));
+        LogTimingSummary();
+        Reset();logWindowEnd=t+logWindowSeconds;
+        return;
+    }
+#endif
     if(!registered)return;
     if(!frameworkFrame)Visibility(false,false);
     frameworkFrame=false;

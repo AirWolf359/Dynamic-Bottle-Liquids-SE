@@ -40,6 +40,11 @@ void AddSection(unsigned hits,unsigned rebuilds,float area,float depth);
 int BeginGPU(ID3D11DeviceContext*,GPUStage stage=GPUStage::Draw);
 void EndGPU(ID3D11DeviceContext*,int);
 struct GPUCost {ID3D11DeviceContext* context;int token;GPUCost(ID3D11DeviceContext* c,GPUStage s,bool measure=true):context(c),token(measure?BeginGPU(c,s):-1){}~GPUCost(){EndGPU(context,token);}};
+#ifdef DBL_VR_TIMING
+// Test builds: run the detailed timers without the overlay. Present logs the
+// summary and resets every window.
+void EnableLogTiming(double windowSeconds);
+#endif
 #ifdef DBL_FRAMEWORK_UI
 void RegisterFramework();
 void LabelDraw(int token,const char* name,uintptr_t instance);
