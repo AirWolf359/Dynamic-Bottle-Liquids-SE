@@ -83,6 +83,11 @@ constexpr bool vrStereo=true;  // Skyrim VR instanced stereo build
 #else
 constexpr bool vrStereo=false;
 #endif
+// VR trace budget: scales each bottle's projected size before the 24-96 step
+// choice. 0 keeps the fixed 96 steps of the direct path (1.0.0.0 behaviour).
+// In-game A/B (VR timing build, 22-28 bottles): x1.00 saved about 10% of DBL's
+// draw time with no visible change; lower scales gave no further measurable gain.
+float vrTraceBudget=1.f;
 thread_local RE::BSRenderPass* active=nullptr;
 thread_local Profile* profile=nullptr;
 using GeometryFn=void(*)(RE::BSShader*,RE::BSRenderPass*,uint32_t);
@@ -569,6 +574,12 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     { // GPU commands are timed at their submission sites, not around CPU setup.
     try{lateDraw=!profile->nativeGlassPrototype&&distanceTuning.optical&&opticalBuffers.prepare(ctx,frame,gpu.refraction,gpu.viewport);}catch(const std::exception& e){opticalBuffers.failed=true;SKSE::log::error("Optical producer unavailable; immediate fallback: {}",e.what());}
     gpu.bubbleInfo.z=lateDraw?1.f:0.f;
+    if constexpr(vrStereo)if(!lateDraw&&vrTraceBudget>0){
+        // VR draws every bottle directly. Give it the screen-size trace budget
+        // that late draws use; the shader scales the projected size by .w.
+        UINT viewports=1;D3D11_VIEWPORT vp{};ctx->RSGetViewports(&viewports,&vp);
+        if(viewports==1&&vp.Width>0&&vp.Height>0){gpu.bubbleInfo.z=1;gpu.bubbleInfo.w=vrTraceBudget;gpu.viewport={vp.TopLeftX,vp.TopLeftY,vp.Width,vp.Height};}
+    }
     ApplyLiquidDrawDistance(gpu,effectWeights,lateDraw,profile->nativeGlassPrototype&&worldDistance);
     if(!distanceTuning.liquidTrace)gpu.bubbleInfo.x=gpu.bubbleInfo.y=0;
     if(lateDraw)sceneSnapshot.status=forwardDraws.enabled?"pre-HDR forward resolve; shared final scene snapshot":"separate optical buffers";
