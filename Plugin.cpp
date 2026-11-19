@@ -731,7 +731,7 @@ void ValidateBottleCoverage(){
     std::vector<std::pair<RE::AlchemyItem*,std::string>> pending;
     std::unordered_set<RE::AlchemyItem*> seen;
     auto normalize=[](std::string s){for(auto& c:s){if(c=='/')c='\\';else c=char(std::tolower(static_cast<unsigned char>(c)));}return s;};
-    unsigned missing=0,conflicts=0;
+    unsigned missing=0,conflicts=0;std::string conflictNames;
     for(const auto& row:assignments){
         for(const auto& name:row.at("profiles"))if(!profiles.contains(name.get<std::string>()))throw std::runtime_error("Assignment references missing profile");
         std::string model=row.at("model");
@@ -742,10 +742,12 @@ void ValidateBottleCoverage(){
         if(!seen.insert(item).second)throw std::runtime_error("Duplicate base bottle assignment");
         const char* current=item->GetModel();
         if(normalize(current?current:"")!=normalize(row.at("original_model").get<std::string>())){
-            ++conflicts;SKSE::log::warn("[DBL-assignment] preserving non-vanilla model for {}",row.at("editor_id").get<std::string>());continue;
+            // Expected with bottle replacers; reported once below.
+            ++conflicts;conflictNames+=(conflictNames.empty()?"":", ")+row.at("editor_id").get<std::string>();continue;
         }
         pending.emplace_back(item,std::move(model));
     }
+    if(conflicts)SKSE::log::info("[DBL-assignment] preserving {} non-vanilla models (replaced by another mod): {}",conflicts,conflictNames);
     // Validate coverage without redirecting vanilla model paths.
     SKSE::log::info("[DBL-coverage] validated={} missing={} model_conflicts={} expected=303; White Phial series excluded",pending.size(),missing,conflicts);
 }
