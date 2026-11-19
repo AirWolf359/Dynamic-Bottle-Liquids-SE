@@ -812,6 +812,9 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 #else
     dblui::SetMode(false,true);
 #endif
+#ifdef DBL_VR_TIMING
+    dblui::EnableLogTiming(10);
+#endif
     try{ApplyAcceptedSettings(distanceTuning);sharedBlurEnabled=true;loadProfiles();}catch(const std::exception& e){SKSE::log::error("Profile load failed: {}",e.what());return false;}
     if(!SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* m){
         #ifdef DBL_FRAMEWORK_UI
