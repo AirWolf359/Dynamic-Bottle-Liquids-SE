@@ -8,6 +8,43 @@ Dynamic Bottle Liquids SE animates liquid inside Skyrim Special Edition bottles.
 
 Install the runtime with the matching SKSE and Address Library. Install compatibility patches after DBL and the bottle replacers they target.
 
+## Skyrim VR
+
+This fork builds a Skyrim VR version of DBL. AirWolf359 maintains it with the agreement of 103Sakamoto, DBL's author. For Skyrim SE and AE, use [the original repository](https://github.com/103Sakamoto/Dynamic-Bottle-Liquids-SE) and the Nexus release above.
+
+### Installing in Skyrim VR
+
+You need Skyrim VR 1.4.15, SKSEVR and the VR Address Library for SKSE Plugins.
+
+1. Install DBL and any compatibility patches from Nexus as usual. They supply the bottle assets, profiles and shaders the VR build uses.
+2. Install this fork's VR release over DBL, and let it overwrite the DLL. The release contains only the VR-specific files:
+   - `SKSE/Plugins/SkyrimBottlePrototype.dll`
+   - `SKSE/Plugins/SkyrimBottlePrototype/BottleVertexVR.cso`
+   - `SKSE/Plugins/SkyrimBottlePrototype/BottleImmediateVR.cso`
+   - `SKSE/Plugins/SkyrimBottlePrototype/BottleNativeLiquidVR.cso`
+
+The VR DLL loads only in Skyrim VR, and the Nexus SE/AE DLL doesn't load in VR. The log is written to `Documents/My Games/Skyrim VR/SKSE/Dynamic Bottle Liquids SE.log`.
+
+### Differences in VR
+
+- Liquid, waves, bubbles and refraction render in both eyes using Skyrim VR's instanced stereo.
+- Refraction uses one scene snapshot per frame, shared by all bottles.
+- Late optical composition and the forward path haven't been ported to stereo yet, so every bottle is drawn directly. Scenes with many bottles may cost more than in SE or AE.
+- Profiles with blurred refraction (`refraction_mip`) don't have a per-eye blur yet.
+- The performance overlay hasn't been tested in VR.
+
+How the liquid looks depends on the bottle replacer's compatibility patch, as it does in SE and AE. For example, the Skyking Potent Potables patch deliberately draws opaque, textured liquid.
+
+This build was tested with Community Shaders Expanded, VR FPS Stabilizer and OpenComposite.
+
+### Building for VR
+
+The VR DLL is the default build. The command is the same as in [Building the runtime](#building-the-runtime). Adding `-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` links MinHook, spdlog and fmt statically, so the DLL needs no other DLLs beside it.
+
+- `python compile_shaders.py` compiles the SE/AE and VR shaders. Ship only the `*VR.cso` files with the VR release.
+- `-DDBL_SKYRIM_VR=OFF` builds the upstream SE/AE DLL. This fork keeps that code so upstream changes merge cleanly.
+- `-DDBL_VR_DIAGNOSTICS=ON` logs periodic draw-interception counters (`[DBL-VR]`) for troubleshooting.
+
 ## Optional performance overlay
 
 Install [SKSE Menu Framework 3](https://www.nexusmods.com/skyrimspecialedition/mods/120352) to enable the overlay. Ctrl+F8 toggles the compact CPU/GPU display. Open **Dynamic Bottle Liquids SE / Performance** in the framework panel for detailed timings and shortcut settings. Select the shortcut button and press your preferred key combination. Press Esc to cancel. Measurements run while a DBL view is visible. The plugin writes `Dynamic Bottle Liquids SE.log` in the Skyrim Special Edition SKSE log folder.
