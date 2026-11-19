@@ -580,7 +580,9 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         UINT viewports=1;D3D11_VIEWPORT vp{};ctx->RSGetViewports(&viewports,&vp);
         if(viewports==1&&vp.Width>0&&vp.Height>0){gpu.bubbleInfo.z=1;gpu.bubbleInfo.w=vrTraceBudget;gpu.viewport={vp.TopLeftX,vp.TopLeftY,vp.Width,vp.Height};}
     }
-    ApplyLiquidDrawDistance(gpu,effectWeights,lateDraw,profile->nativeGlassPrototype&&worldDistance);
+    // VR draws world bottles directly; give them the same distance weights as
+    // SE's late-drawn world bottles instead of full detail at every distance.
+    ApplyLiquidDrawDistance(gpu,effectWeights,lateDraw,(profile->nativeGlassPrototype||vrStereo)&&worldDistance);
     if(!distanceTuning.liquidTrace)gpu.bubbleInfo.x=gpu.bubbleInfo.y=0;
     if(lateDraw)sceneSnapshot.status=forwardDraws.enabled?"pre-HDR forward resolve; shared final scene snapshot":"separate optical buffers";
     else if(profile->directNativeLiquid){
