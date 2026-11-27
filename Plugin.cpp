@@ -588,6 +588,13 @@ void ReportFittingCapture(const char* reason){
         if(reported.emplace(reason).second)SKSE::log::info("[DBL-VR-fitting] Not borrowed: {}",reason);
     }
 }
+// Skyrim VR: log each screen shadow mask outcome once.
+void ReportShadowMask(const char* outcome){
+    if constexpr(vrStereo){
+        static std::unordered_set<std::string_view> reported;
+        if(reported.emplace(outcome).second)SKSE::log::info("[DBL-VR-shadow] {}",outcome);
+    }
+}
 thread_local std::unordered_map<const RE::BSGeometry*,FittingSample> fittingSamples;
 thread_local RE::BSGeometry* fittingBottle=nullptr;
 thread_local RE::BSGeometry* fittingGeometry=nullptr;
@@ -744,18 +751,20 @@ ComPtr<ID3D11ShaderResourceView> NativeSunShadow(ID3D11DeviceContext* ctx,bool f
     ComPtr<ID3D11ShaderResourceView> bound;
     ctx->PSGetShaderResources(14,1,&bound);
     if(fittingMask)bound=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV);
-    else if(bound.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV))return {};
+    else if(bound.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV)){ReportShadowMask("Not used: the bottle's draw has no shadow mask at t14");return {};}
     ComPtr<ID3D11RenderTargetView> output;
     ctx->OMGetRenderTargets(1,&output,nullptr);
     if(!output)return {};
     ComPtr<ID3D11Resource> outputResource;
     output->GetResource(&outputResource);
-    if(outputResource.Get()!=reinterpret_cast<ID3D11Texture2D*>(main.texture))return {};
+    if(outputResource.Get()!=reinterpret_cast<ID3D11Texture2D*>(main.texture)){ReportShadowMask("Not used: the bottle isn't drawn to the main target");return {};}
 
     D3D11_TEXTURE2D_DESC shadowDesc{},mainDesc{};
     reinterpret_cast<ID3D11Texture2D*>(mask.texture)->GetDesc(&shadowDesc);
     reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
-    if(shadowDesc.Width!=mainDesc.Width||shadowDesc.Height!=mainDesc.Height||shadowDesc.SampleDesc.Count!=1)return {};
+    if(shadowDesc.Width!=mainDesc.Width||shadowDesc.Height!=mainDesc.Height||shadowDesc.SampleDesc.Count!=1){
+        ReportShadowMask("Not used: the shadow mask's size or sampling differs from the main target");return {};
+    }
     return bound;
 }
 
@@ -1306,8 +1315,9 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     if(profile->nativeGlassPrototype&&captured&&native.csStrict&&communityLighting.liveBindingsReady(ctx))gpu.eye.w=float(unsigned(gpu.eye.w)|4u);
     const FittingSample* fitting=nullptr;
     bool reflectionShadowed=false;
-    // VR: the screen shadow mask, TMD's reflection lighting and bottle projection
-    // assume one view, so they stay off in the stereo build.
+    // VR: TMD's reflection lighting and bottle projection assume one view, so they
+    // stay off in the stereo build. The screen shadow mask is double-wide like the
+    // main target, so each eye's pixels already address their own half.
     const NativeConstantSlice* reflectionLighting=!vrStereo&&profile->authoredGlass?
         tmdReflections.Lighting(ctx,g,&reflectionShadowed):nullptr;
     const NativeConstantSlice* borrowedLight=nullptr;
@@ -1349,13 +1359,13 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
                 gpu.fittingPosition.y=1;
                 gpu.fittingColor.w=-1;
             }
-            if(!vrStereo&&!profile->authoredGlass&&(fitting||std::string_view(g->name.c_str()).starts_with("DBL_SSE_TMDWinery_"))){
+            if(!profile->authoredGlass&&(fitting||std::string_view(g->name.c_str()).starts_with("DBL_SSE_TMDWinery_"))){
                 native.sunShadow=NativeSunShadow(ctx,fitting!=nullptr);
-                if(native.sunShadow)gpu.eye.w=float(unsigned(gpu.eye.w)|32u);
+                if(native.sunShadow){gpu.eye.w=float(unsigned(gpu.eye.w)|32u);ReportShadowMask("Light shadow mask applied (interior)");}
             }
-        }else if(cell&&!vrStereo){
+        }else if(cell){
             native.sunShadow=NativeSunShadow(ctx);
-            if(native.sunShadow)gpu.eye.w=float(unsigned(gpu.eye.w)|16u);
+            if(native.sunShadow){gpu.eye.w=float(unsigned(gpu.eye.w)|16u);ReportShadowMask("Sun shadow mask applied (exterior)");}
         }
     }
     if(!vrStereo&&worldDistance&&gpu.bounds.w>=2&&gpu.bounds.z>0){
