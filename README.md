@@ -34,6 +34,8 @@ All supported bottles, including compatibility patches, use half as many cavity 
 
 ## Building the runtime
 
+[Download the 1.1.0 source package from GitHub Releases](https://github.com/103Sakamoto/Dynamic-Bottle-Liquids-SE/releases/tag/v1.1.0).
+
 Use 64-bit MSVC with C++23, CMake 3.25 or newer, Git, and vcpkg. Configure with the vcpkg toolchain and build the Release configuration.
 
 ~~~powershell

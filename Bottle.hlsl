@@ -10,11 +10,13 @@ cbuffer NativeGeometry : register(b2) { row_major float3x4 World; };
 cbuffer NativeFrame : register(b12) { row_major float3x3 ViewRotation : packoffset(c0); row_major float4x4 ViewProj : packoffset(c8); };
 cbuffer NativeUV : register(b1) { float4 TexcoordOffset : packoffset(c2); };
 #else
+#include "RefractionCamera.hlsli"
 cbuffer SceneMaterial : register(b1) { float4 EnvironmentData : packoffset(c2); };
 cbuffer SceneLighting : register(b2) {
     float3 LightDirection : packoffset(c0);
     float3 LightColor : packoffset(c1);
     float4 MaterialData : packoffset(c3);
+    float4 NativeShadowChannel : packoffset(c2);
     row_major float3x4 Ambient : packoffset(c11);
     float4 LightPositions[7] : packoffset(c15);
     float4 LightColors[7] : packoffset(c22);
@@ -22,6 +24,7 @@ cbuffer SceneLighting : register(b2) {
 };
 TextureCube<float4> Environment : register(t4);
 SamplerState EnvironmentSampler : register(s4);
+Texture2D<float4> NativeLiquidGlow : register(t3);
 Texture2D<float4> SurfaceBase : register(t0);
 Texture2D<float4> SurfaceNormal : register(t1);
 SamplerState BaseSampler : register(s0);
@@ -38,6 +41,9 @@ SamplerState RippleSampler : register(s13);
 Texture2D<float> SceneDepth : register(t14);
 Texture2D<float4> SceneColor : register(t15);
 SamplerState SceneSampler : register(s15);
+cbuffer FittingGeometry:register(b8){row_major float3x4 DonorWorld;};
+cbuffer FittingLighting:register(b7){float4 DonorChannel:packoffset(c2);float4 DonorPosition:packoffset(c15);float4 DonorColor:packoffset(c22);float2 DonorCounts:packoffset(c29);};
+Texture2D<float4> SunShadowMask : register(t38);
 #endif
 cbuffer Bottle : register(b10) {
     float4 Eye, Plane, Wave, Detail, LiquidColor, GlassColor;
@@ -65,6 +71,14 @@ cbuffer Bottle : register(b10) {
     float4 LiquidEffects; // emission, extra glass refraction scale, liquid scene mip, point-light scattering reduction
     float4 LiquidIndependentAnimation; // per-geometry scroll; native UV above still restores stationary glass
     float4 LiquidTexturePlane; // smoothed bulk normal.xyz, fixed upright pivot height.w
+    float4 FittingPosition; // verify fitting pose, same-bottle reflection source
+    float4 FittingColor;
+    float4 FittingRows[3];
+    float4 EmissionColor;
+    float4 TraceSettings; // sample cap, transmission mip, refraction mip, normal strength delta
+    float4 VisualLight; // deltas for sunlight, point, backlight and thickness
+    float4 VisualSurface; // glass highlight, liquid visibility, glass visibility, opacity override flag
+    float4 RusticMapping; // original donor bottom, top, mapping enabled, reserved
 };
 #ifndef DBL_VERTEX
 #include "CommunityLighting.hlsli"
@@ -94,47 +108,79 @@ float3 liquidTextureSamplePoint(float3 shell,float3 eye,float3 dir,float3 legacy
     }
     return shell;
 }
-float3 texturedLiquidColor(float3 q,float lod) {
-    float3 t=liquidTexturePosition(q)/max(Bounds.z*2,.001);
-    // Mirrored coordinates keep the extracted atlas strip inside its own tile,
-    // regardless of the native sampler's wrap/clamp setting. Three projections
-    // make a continuous volume field, including the top; no extra march steps.
-    float3 uv=abs(frac(t*.5+.5)*2-1);
-    uint width,height;SurfaceBase.GetDimensions(width,height);
-    float2 dimensions=max(float2(width,height),1);
-    float2 region=LiquidTextureRect.zw-LiquidTextureRect.xy;
-    lod+=log2(max(1,max(region.x*width,region.y*height))/512);
-    // Keep bilinear footprints and selected mip footprints inside this atlas
-    // region, so distant liquid cannot pick up neighboring metal/label colors.
-    lod=clamp(lod,0,max(0,log2(max(1,min(region.x*width,region.y*height)/4))));
-    float2 inset=min(exp2(lod)/dimensions,region*.25);
-    float2 lo=LiquidTextureRect.xy+inset,hi=LiquidTextureRect.zw-inset;
-    float2 ua=uv.xy,ub=uv.yz,uc=uv.zx;
-    if(((uint)round(LiquidMaterial.w)&4)!=0){
-        // Full-texture liquids: independent rotated/offset projections avoid
-        // the bilateral folds of mirrored atlas wrapping. Same three samples.
-        ua=frac(float2(.8*t.x-.6*t.y,.6*t.x+.8*t.y)+float2(.17,.31));
-        ub=frac(float2(.6*t.y+.8*t.z,-.8*t.y+.6*t.z)+float2(.43,.07));
-        uc=frac(float2(.8*t.z-.6*t.x,.6*t.z+.8*t.x)+float2(.73,.59));
+float radius(float z);
+float2 liquidChartUV(float2 chart,float4 anim,uint flags,bool rustic,float2 inset) {
+    if(rustic)return frac(lerp(LiquidTextureRect.xy,LiquidTextureRect.zw,chart)*anim.zw+anim.xy);
+    if((flags&1)!=0)chart=frac(chart*anim.zw+anim.xy);
+    return lerp(LiquidTextureRect.xy+inset,LiquidTextureRect.zw-inset,chart);
+}
+float3 texturedLiquidColor(float3 q,float lod,float surfaceDepth,out float3 emissionPattern,float axialView=0) {
+    bool rustic=RusticMapping.z>0;
+    uint flags=(uint)round(LiquidMaterial.w);
+    bool bulk=(flags&16)!=0;
+    float low=rustic?RusticMapping.x:Bounds.x;
+    float high=rustic?RusticMapping.y:Bounds.y;
+    float span=max(.001,high-low);
+    float strength=smoothstep(0,.12*span,surfaceDepth);
+    if(strength<=0){
+        emissionPattern=LiquidColor.rgb;
+        return LiquidColor.rgb;
     }
-    if((((uint)round(LiquidMaterial.w)&1)!=0)){
-        // Apply the engine's authored animation AFTER the liquid-attached
-        // coordinates. Wrap, do not mirror the animated offset: one authored
-        // ten-second scroll remains one ten-second cycle, with no reversal.
-        float4 animation=(((uint)round(LiquidMaterial.w)&8)!=0)?LiquidIndependentAnimation:LiquidAnimation;
-        ua=frac(ua*animation.zw+animation.xy);
-        ub=frac(ub*animation.zw+animation.xy);
-        uc=frac(uc*animation.zw+animation.xy);
+    float3 local=liquidTexturePosition(q);
+    float sectionRadius=radius(clamp(q.z,Bounds.x,Bounds.y));
+    float radial=length(local.xy)/max(.001,sectionRadius);
+    float planarWeight=max(smoothstep(.30,.78,axialView),1-smoothstep(.12,.55,radial));
+    float4 anim=(flags&8)!=0?LiquidIndependentAnimation:LiquidAnimation;
+    float2 inset=0;
+    if(!rustic){
+        uint w,h;SurfaceBase.GetDimensions(w,h);
+        float2 size=max(float2(w,h),1);
+        float2 region=LiquidTextureRect.zw-LiquidTextureRect.xy;
+        lod=clamp(lod+log2(max(1,max(region.x*w,region.y*h))/512),0,
+                  max(0,log2(max(1,min(region.x*w,region.y*h)/4))));
+        inset=min(exp2(lod)/size,region*.25);
     }
-    float3 a=SurfaceBase.SampleLevel(BaseSampler,lerp(lo,hi,ua),lod).rgb;
-    float3 b=SurfaceBase.SampleLevel(BaseSampler,lerp(lo,hi,ub),lod).rgb;
-    float3 c=SurfaceBase.SampleLevel(BaseSampler,lerp(lo,hi,uc),lod).rgb;
-    float3 pattern=(a+b+c)/3;
-    if(((uint)round(LiquidMaterial.w)&2)!=0)pattern*=LiquidColor.rgb;
-    return lerp(LiquidColor.rgb,pattern,LiquidMaterial.y);
+    // Blend the sampled textures so angular wrap never interpolates across
+    // atlas tiles. Skip the other projection at either end of the blend.
+    float2 cylindricalUV=0,planarUV=0;
+    float3 cylindrical=0,planar=0;
+    if(planarWeight<1){
+        float height=local.z+(bulk?LiquidTexturePlane.w:Plane.w)-LiquidMaterial.z;
+        float2 chart=float2(.5+atan2(local.y,local.x)/6.2831853,1-saturate((height-low)/span));
+        cylindricalUV=liquidChartUV(chart,anim,flags,rustic,inset);
+        cylindrical=SurfaceBase.SampleLevel(BaseSampler,cylindricalUV,lod).rgb;
+    }
+    if(planarWeight>0){
+        float3 center=float3(0,0,(Bounds.x+Bounds.y)*.5);
+        float halfHeight=(Bounds.y-Bounds.x)*.5;
+        float extent=max(.001,length(float2(Bounds.z,halfHeight)));
+        float2 chart=saturate(.5+(local.xy-liquidTexturePosition(center).xy)*float2(.5,-.5)/extent);
+        planarUV=liquidChartUV(chart,anim,flags,rustic,inset);
+        planar=SurfaceBase.SampleLevel(BaseSampler,planarUV,lod).rgb;
+    }
+    float3 pattern=lerp(cylindrical,planar,planarWeight);
+    const float3 luminance=float3(.2126,.7152,.0722);
+    float3 hue=LiquidColor.rgb/max(max(LiquidColor.r,LiquidColor.g),max(LiquidColor.b,.0001));
+    if(rustic)pattern=hue*dot(pattern,luminance);
+    else if((flags&2)!=0)pattern*=LiquidColor.rgb;
+    float3 tint=lerp(LiquidColor.rgb,pattern,LiquidMaterial.y*strength);
+    emissionPattern=tint;
+    if(EmissionColor.w>1.5){
+        float3 cylinderGlow=0,planeGlow=0;
+        if(planarWeight<1)cylinderGlow=NativeLiquidGlow.SampleLevel(BaseSampler,cylindricalUV,lod).rgb;
+        if(planarWeight>0)planeGlow=NativeLiquidGlow.SampleLevel(BaseSampler,planarUV,lod).rgb;
+        float3 glow=lerp(cylinderGlow,planeGlow,planarWeight);
+        if(rustic)glow=hue*dot(glow,luminance);
+        emissionPattern=lerp(LiquidColor.rgb,glow,strength);
+    }
+    return tint;
 }
 #endif
 struct Vertex { float4 position : POSITION; float4 normal : NORMAL; float2 uv:TEXCOORD0; float4 tangent:TANGENT; };
+#ifndef DBL_VERTEX
+static float RefractionDepthSign=1;
+float orderedSceneDepth(float z){return z*RefractionDepthSign;}
+#endif
 struct Pixel { float4 fog:COLOR1; float4 position : SV_POSITION; float3 local : TEXCOORD0; nointerpolation float3 localEye : TEXCOORD1; float3 world : TEXCOORD2; nointerpolation float3x3 basis : TEXCOORD3; float3 normal : TEXCOORD6; float2 uv:TEXCOORD7; float3 tangent:TEXCOORD8; float3 bitangent:TEXCOORD9; nointerpolation float3x3 viewBasis:TEXCOORD10; nointerpolation float4 clipOrigin:TEXCOORD13; nointerpolation float4 clipX:TEXCOORD14; nointerpolation float4 clipY:TEXCOORD15; nointerpolation float4 clipZ:TEXCOORD16; };
 #ifdef DBL_VERTEX
 Pixel VSMain(Vertex v) {
@@ -275,6 +321,7 @@ float fieldFromCavity(float3 p,float cavity) {
         rimHeight+=min(.06*ViscousSurface.x,localRadius*.03);
         rimWidth+=min(.35*ViscousSurface.y,localRadius*.15);
     }
+    rimWidth*=1+ViscousSurface.w;
     float meniscus=rimHeight*pow(saturate(1-wall/rimWidth),3);
     return dot(p,Plane.xyz)-Plane.w-displacement-meniscus;
 }
@@ -634,6 +681,7 @@ float3 diagnosticColor(int state){
     if(state==8)return float3(1,1,0);       // Valid, but <=10% scene transmission.
     return float3(0,1,0);                  // Valid screen-space liquid lens.
 }
+
 int diagnosticFinalState(int state,float3 transmission,bool foreground){
     if(state==7||state==8){
         if(foreground)return 6;
@@ -650,7 +698,7 @@ float3 sampleRefractionScene(float2 pixel,float2 size,float depth){
         if(w>0&&h>0){
             float2 uv=pixel/size;int2 corner=int2(floor(uv*float2(w,h)-.5));bool safe=true;
             [unroll]for(int y=0;y<2;y++)[unroll]for(int x=0;x<2;x++)
-                safe=safe&&(DownsampledScene.Load(int3(clamp(corner+int2(x,y),int2(0,0),int2(w-1,h-1)),mip)).a>=depth-1e-6);
+                safe=safe&&(DownsampledScene.Load(int3(clamp(corner+int2(x,y),int2(0,0),int2(w-1,h-1)),mip)).a>=orderedSceneDepth(depth)-1e-6);
             if(safe)return DownsampledScene.SampleLevel(SceneSampler,uv,mip).rgb;
         }
     }
@@ -662,9 +710,11 @@ float3 sampleRefractionScene(float2 pixel,float2 size,float depth){
 // Replace destination colour: never add an unbent destination image.
 #define OpticalOutput float4
 static float2 ForwardPixel;
+void rejectForwardForeground(float2 pixel,float depth){
+    if(orderedSceneDepth(SceneDepth.Load(int3(int2(pixel),0)))<orderedSceneDepth(depth)-1e-6)discard;
+}
 float4 opticalResult(float3 light,float3 transmission,float2 target,float depth){
     float2 pixel=ForwardPixel; // supplied below through the pixel entry point
-    if(SceneDepth.Load(int3(int2(pixel),0))<depth-1e-6)discard;
     float2 size=Refraction.yz;
     float2 shifted=clamp(target,.5,size-.5);bool valid=true;
     // Only the sampled footprint contributes color. Intermediate screen pixels
@@ -673,7 +723,7 @@ float4 opticalResult(float3 light,float3 transmission,float2 target,float depth)
         int2 corner=int2(floor(shifted-.5));
         [unroll]for(int y=0;y<2;y++)[unroll]for(int x=0;x<2;x++){
             int2 tap=clamp(corner+int2(x,y),int2(0,0),int2(size)-1);
-            if(SceneDepth.Load(int3(tap,0))<depth-1e-6)valid=false;
+            if(orderedSceneDepth(SceneDepth.Load(int3(tap,0)))<orderedSceneDepth(depth)-1e-6)valid=false;
         }
     }
 #if DBL_REFRACTION_DIAGNOSTIC
@@ -708,10 +758,16 @@ static float NativeLiquidDepth;
 #endif
 float4 PSMain(Pixel p) : SV_TARGET {
 #endif
+    RefractionDepthSign=(Refraction.x==2||Refraction.x==4)?-1:1;
+    if(Refraction.x>=3)RefractionDepthSign=ProjectionDepthSign(RefractionDepthSign);
 #ifdef DBL_REFERENCE_EYE
     p.localEye=Eye.xyz; // Offline camera-reference path; production uses VS-derived eye.
 #endif
     selectFrontShell(p);
+#ifdef DBL_FORWARD
+    // Reject foreground before tracing the bottle. Refraction still tests the shifted taps.
+    rejectForwardForeground(p.position.xy,p.position.z);
+#endif
 #ifndef DBL_DISABLE_NATIVE_LIQUID_UV
     // The cloned UV controller is evaluated by Skyrim on this visible material.
     // Undo its transform for glass detail; only the liquid sampler consumes it.
@@ -724,27 +780,46 @@ float4 PSMain(Pixel p) : SV_TARGET {
     float3 center=float3(0,0,(Bounds.x+Bounds.y)*.5);
     float sphere=sqrt(pow(Bounds.z*max(1,CavityPlanes[0].z),2)+pow((Bounds.y-Bounds.x)*.5,2));
     float3 oc=p.localEye-center; float b=dot(oc,dir), c=dot(oc,oc)-sphere*sphere;
-    float discriminant=b*b-c; float lengthWet=0; float wetEntry=1e30; float wetEntryStep=0; float surface=0; float3 surfaceHit=0;
+    float discriminant=b*b-c; float lengthWet=0; float wetEntry=1e30; float wetEntryStep=0; float entrySurfaceDepth=0; float surface=0; float3 surfaceHit=0;
     if(discriminant>0&&effectWeight(19)>0) {
         float nearT=max(0,-b-sqrt(discriminant)); float farT=-b+sqrt(discriminant);
+        // Start and end the trace on the axial caps. A sidewall and the floor
+        // can otherwise cross between two samples that both appear dry.
+        if(abs(dir.z)>1e-8){
+            float2 caps=(Bounds.xy-p.localEye.z)/dir.z;
+            nearT=max(nearT,min(caps.x,caps.y));
+            farT=max(nearT,min(farT,max(caps.x,caps.y)));
+        }
         int steps=staticLOD?12:colorTraceSteps(p,sphere),first,last;
-        steps=(steps+1)/2;
+        int cap=TraceSettings.x>0?(int)clamp(TraceSettings.x,12,192):48;
+        steps=staticLOD?6:max(1,(steps*cap+48)/96);
         float span=max(0,farT-nearT);
         float stepSize=span/steps;
         traceRange(p.localEye,dir,nearT,farT,steps,first,last);
         float3 previous=p.localEye+dir*(nearT+first*stepSize);
         int colorSegment=0;float4 colorEndpoints=0;
-        float previousCavity=max(crossSection(previous.xy)-colorRadius(clamp(previous.z,Bounds.x,Bounds.y),colorSegment,colorEndpoints),max(Bounds.x-previous.z,previous.z-Bounds.y));
+        float previousWall=crossSection(previous.xy)-colorRadius(clamp(previous.z,Bounds.x,Bounds.y),colorSegment,colorEndpoints);
+        float previousCavity=max(previousWall,max(Bounds.x-previous.z,previous.z-Bounds.y));
         float previousSurface=staticLOD?dot(previous,Plane.xyz)-Plane.w:fieldFromCavity(previous,previousCavity);
-        float previousWet=max(previousCavity,previousSurface);
         [loop] for(int i=first;i<last;i++) {
             float3 q=p.localEye+dir*(nearT+(i+1)*stepSize);
-            float cavity=max(crossSection(q.xy)-colorRadius(clamp(q.z,Bounds.x,Bounds.y),colorSegment,colorEndpoints),max(Bounds.x-q.z,q.z-Bounds.y));
+            float wall=crossSection(q.xy)-colorRadius(clamp(q.z,Bounds.x,Bounds.y),colorSegment,colorEndpoints);
+            float cavity=max(wall,max(Bounds.x-q.z,q.z-Bounds.y));
             float f=staticLOD?dot(q,Plane.xyz)-Plane.w:fieldFromCavity(q,cavity);
-            float wet=max(cavity,f);
-            float wetPart=segmentWet(previousWet,wet);
+            // Wall entry and free-surface exit can both occur within one step.
+            // Intersect their linear intervals before computing occupied length.
+            float enter=0,leave=1;
+            float2 ends=float2(wall,f),starts=float2(previousWall,previousSurface);
+            float2 delta=ends-starts;
+            [unroll]for(int boundary=0;boundary<2;++boundary){
+                if(starts[boundary]>0 && ends[boundary]>0)leave=0;
+                else if(starts[boundary]>0)enter=max(enter,-starts[boundary]/delta[boundary]);
+                else if(ends[boundary]>0)leave=min(leave,-starts[boundary]/delta[boundary]);
+            }
+            float wetPart=max(0,leave-enter);
             if(wetPart>0 && wetEntry==1e30){
-                wetEntry=nearT+(i+(previousWet<=0?0:1-wetPart))*stepSize;wetEntryStep=stepSize;
+                wetEntry=nearT+(i+enter)*stepSize;wetEntryStep=stepSize;
+                entrySurfaceDepth=max(0,-lerp(previousSurface,f,enter));
             }
             lengthWet+=wetPart*stepSize;
             if(previousSurface>0&&f<=0) {
@@ -753,7 +828,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
                 float coverage=saturate(-cavityField(hit)/max(stepSize,.001));
                 if(surface==0&&coverage>0){surface=coverage;surfaceHit=hit;}
             }
-            previous=q;previousSurface=f;previousWet=wet;
+            previous=q;previousSurface=f;previousWall=wall;
         }
     }
 #ifdef DBL_SURFACE_DIAGNOSTIC
@@ -786,7 +861,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
     if(dot(normal,view)<0)normal=-normal;
     float fresnel=(.04+.96*pow(1-saturate(dot(normal,view)),5))*effectWeight(18);
     float liquidAlpha=1-exp(-lengthWet*LiquidColor.w*.45*effectWeight(14));
-    if(Appearance.z>0 && lengthWet>0 && effectWeight(14)>0)liquidAlpha=Appearance.z;
+    if((Appearance.z>0 || VisualSurface.w>0) && lengthWet>0 && effectWeight(14)>0)liquidAlpha=Appearance.z;
     // A soft view-relative highlight is an appearance approximation, not sampled
     // scene lighting or environment reflection. Keep it subtle in dark scenes.
     float3 tangent=normalize(cross(abs(view.z)<.95?float3(0,0,1):float3(0,1,0),view));
@@ -796,19 +871,23 @@ float4 PSMain(Pixel p) : SV_TARGET {
 #ifdef DBL_SCATTERING_TEST
     return float4(liquidAlpha,0,saturate(lengthWet/max(Bounds.z*.6,.001)),1);
 #endif
-    float thickness=lengthWet/max(Bounds.z*2,.001)*effectWeight(16);
+    float thickness=lengthWet/max(Bounds.z*2,.001)*effectWeight(16)*(1+VisualLight.w);
     // Wavelength-dependent attenuation: shallow paths stay brighter while
     // longer paths become darker and more saturated without contour thresholds.
     // Extinction still controls transmission separately. Retain a lit scattering
     // contribution in thick liquid instead of driving its local radiance to black.
+    float3 emissionPattern=RusticMapping.z>0 ? LiquidColor.rgb : 1;
     float3 liquidTint=LiquidColor.rgb;
     [branch] if(LiquidMaterial.y>0&&(textureFlags&1)){
         // Derivatives execute uniformly for this draw, before the occupancy test.
         float textureLod=max(0,log2(max(length(ddx(p.local)),length(ddy(p.local)))*512/max(Bounds.z*2,.001)));
         if(lengthWet>0){
+            bool bulk=((uint)round(LiquidMaterial.w)&16)!=0;
+            float3 textureAxis=normalize(bulk?LiquidTexturePlane.xyz:Plane.xyz);
+            float axialView=abs(dot(dir,textureAxis));
             float3 samplePoint=surface>0?surfaceHit:p.localEye+dir*(wetEntry+min(lengthWet*.15,Bounds.z*.15));
             samplePoint=liquidTextureSamplePoint(p.local,p.localEye,dir,samplePoint);
-            liquidTint=texturedLiquidColor(samplePoint,textureLod);
+            liquidTint=texturedLiquidColor(samplePoint,textureLod,surface>0?0:entrySurfaceDepth,emissionPattern,axialView);
         }
     }
     float3 liquid=liquidTint*1.3*(.30+.70*exp(-thickness*float3(1.0,2.3,1.8)));
@@ -838,7 +917,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
     // them into a solid outline. No radiance is added without an incident light.
     float contactGap=max(0,-cavityField(surfaceHit));
     float footprint=max(fwidth(contactGap),.001);
-    float rimWidth=.35*(1+ViscousSurface.y);
+    float rimWidth=.35*(1+ViscousSurface.y)*(1+ViscousSurface.w);
     float meniscusRim=effectWeight(10)*surface*(1-smoothstep(0,rimWidth+footprint,contactGap))*rimWidth/(rimWidth+footprint)*(1+ViscousSurface.x);
 #ifdef DBL_NO_MENISCUS
     meniscusRim=0;
@@ -902,20 +981,63 @@ float4 PSMain(Pixel p) : SV_TARGET {
         float3 hitPosition=modelLighting?surfaceHit:p.world+mul(p.basis,surfaceHit-p.local);
         // Broad forward scattering when the light is behind the bottle. This is
         // scene-lit (no emissive floor) and does not change liquid coverage.
+        float backlightStrength=.325*(1+VisualLight.z);
         float backlight=pow(saturate(dot(-v,l)),4);
-        float3 volumeLight=(useCS?csAmbient(ambientVolume):ambientVolume)+directionalColor*(.45+.65*backlight);
+        float3 liquidSun=directionalColor;
+        [branch] if(textureFlags&16)liquidSun*=SunShadowMask.Load(int3(int2(p.position.xy),0)).r;
+        float3 volumeLight=(useCS?csAmbient(ambientVolume):ambientVolume)+liquidSun*(1+VisualLight.x)*(.45+backlightStrength*backlight);
         float pointLightScattering=1-LiquidEffects.w;
         float3 ambientTop=max(0,mul(Ambient,float4(sn,1)));
-        float3 topLight=(useCS?csAmbient(ambientTop):ambientTop)+directionalColor*saturate(dot(sn,l));
-        float3 topSpecular=directionalColor*pow(saturate(dot(sn,normalize(l+v+1e-6))),48);
-        float3 rippleSpecular=directionalColor*pow(saturate(dot(rn,normalize(l+v+1e-6))),48);
+        float3 topLight=(useCS?csAmbient(ambientTop):ambientTop)+liquidSun*(1+VisualLight.x)*saturate(dot(sn,l));
+        float3 topSpecular=liquidSun*pow(saturate(dot(sn,normalize(l+v+1e-6))),48);
+        float3 rippleSpecular=liquidSun*pow(saturate(dot(rn,normalize(l+v+1e-6))),48);
         uint2 cluster=0;if(useCS)cluster=csCluster(p.position);
         uint lightCount=useCS?min(CSStrictCount,15)+cluster.y:(uint)clamp((int)LightCounts.x,0,7);
+        bool reflectionSource=FittingPosition.y>.5;
+        bool fromDraw=FittingColor.w!=0 && DonorPosition.w>0 &&
+            (reflectionSource ? DonorCounts.x>=1 && DonorCounts.y>=1 : DonorCounts.x==1);
+        if(fromDraw && FittingPosition.x>0 && !useCS && lightCount==0){
+            float3 offset=float3(FittingRows[0].w,FittingRows[1].w,FittingRows[2].w);
+            float3 origin=p.world+mul(p.basis,offset-p.local);
+            float3x3 expected=mul(p.basis,float3x3(FittingRows[0].xyz,FittingRows[1].xyz,FittingRows[2].xyz));
+            float3x3 diff=abs(expected-(float3x3)DonorWorld);
+            fromDraw=all(abs(origin-float3(DonorWorld[0].w,DonorWorld[1].w,DonorWorld[2].w))<.05)
+                && all(max(diff[0],max(diff[1],diff[2]))<.002);
+        }
+        bool addDonor=!useCS && fromDraw && (reflectionSource||lightCount==0);
+        float4 donorPosition=DonorPosition;
+        if(addDonor){
+            if(FittingColor.w>0){
+                float4 pos=float4(donorPosition.xyz,1);
+                donorPosition=float4(dot(FittingRows[0],pos),dot(FittingRows[1],pos),dot(FittingRows[2],pos),donorPosition.w*FittingColor.w);
+                if(!modelLighting){
+                    donorPosition.xyz=p.world+mul(p.basis,donorPosition.xyz-p.local);
+                    donorPosition.w*=length(mul(p.basis,float3(1,0,0)));
+                }
+            }else if(modelLighting){
+                float scale=max(length(mul(p.basis,float3(1,0,0))),.0001);
+                donorPosition.xyz=p.local+mul(donorPosition.xyz-p.world,p.basis)/(scale*scale);
+                donorPosition.w/=scale;
+            }
+            [loop] for(uint j=0;j<lightCount;j++){
+                if(distance(LightPositions[j].xyz,donorPosition.xyz)<.01 &&
+                   abs(LightPositions[j].w-donorPosition.w)<.01)addDonor=false;
+            }
+        }
+        uint nativeCount=lightCount;
+        lightCount+=addDonor?1:0;
         [loop] for(uint i=0;i<lightCount;i++) {
             CSLight csLight=(CSLight)0;
             float4 lightPosition;float3 incidentColor;
+            bool fromDonor=addDonor&&i==nativeCount;
             if(useCS){if(!csLightAt(i,cluster.x,csLight))continue;lightPosition=csLight.positionWS;lightPosition.w=csLight.radius;incidentColor=csLightColor(csLight);}
+            else if(fromDonor){lightPosition=donorPosition;incidentColor=max(0,DonorColor.rgb);}
             else {lightPosition=LightPositions[i];incidentColor=max(0,LightColors[i].rgb);}
+            // The screen mask has no valid receiver for the borrowed light.
+            if(!useCS && !fromDonor && (textureFlags&32) && i<4 && i<LightCounts.y){
+                uint channel=(uint)clamp(NativeShadowChannel[i],0,3);
+                incidentColor*=SunShadowMask.Load(int3(int2(p.position.xy),0))[channel];
+            }
             float3 delta=lightPosition.xyz-lightingPosition;
             float distance=length(delta); float3 direction=delta/max(distance,.0001);
             float attenuation=useCS?csAttenuation(distance,csLight):1-pow(saturate(distance/max(lightPosition.w,.0001)),2);
@@ -923,7 +1045,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
             illumination+=color*saturate(dot(n,direction));
             specular+=color*pow(saturate(dot(n,normalize(direction+v+1e-6))),AuthoredSpec.w)*gloss*AuthoredSpec.rgb;
             wetSpecular+=color*pow(saturate(dot(n,normalize(direction+v+1e-6))),24);
-            volumeLight+=color*(.45+.65*pow(saturate(dot(-v,direction)),4))*pointLightScattering;
+            volumeLight+=color*(.45+backlightStrength*pow(saturate(dot(-v,direction)),4))*pointLightScattering*(1+VisualLight.y);
             float3 topDelta=lightPosition.xyz-hitPosition;
             float topDistance=length(topDelta);float3 topDirection=topDelta/max(topDistance,.0001);
             float3 topColor=incidentColor*(useCS?csAttenuation(topDistance,csLight):(1-pow(saturate(topDistance/max(lightPosition.w,.0001)),2)));
@@ -956,13 +1078,17 @@ float4 PSMain(Pixel p) : SV_TARGET {
     }
     // Self-lit liquid is independent of scene lights and is composed behind
     // glass using the existing liquid coverage. It adds no scene light/pass.
-    liquid+=liquidTint*LiquidEffects.x;
+    float3 emission=RusticMapping.z>0 ? emissionPattern :
+        (EmissionColor.w>0 ? EmissionColor.rgb*emissionPattern : liquidTint);
+    liquid+=emission*LiquidEffects.x;
     reflectedLight*=effectWeight(11);
     reflectedLight*=(1-wear*.65)*(1+1.5*wet);
     glass*=effectWeight(17);glassAlpha*=effectWeight(17);reflectedLight*=effectWeight(17);wear*=effectWeight(17);
     // Surface highlights are reflected radiance, independent of shell opacity.
     // Keep authored material response, wear occlusion and the glass feature gate.
     glassHighlight*=effectWeight(17)*(1-wear);
+    if(Appearance.y<=.5 && LiquidEffects.x>0)
+        glass+=LiquidColor.rgb*(0.20*LiquidEffects.x);
     float oldGlassAlpha=glassAlpha;
     glassAlpha=wear+oldGlassAlpha*(1-wear);
     glass=(wearColor*wearLighting*wear+glass*oldGlassAlpha*(1-wear))/max(glassAlpha,.001);
@@ -975,6 +1101,9 @@ float4 PSMain(Pixel p) : SV_TARGET {
     // Actual contact history gates it: dry glass and submerged pixels get zero.
     float filmAlpha=.65*saturate(WetInfo.w)*wet*effectWeight(17)*(Appearance.y>.5?0:1);
     float3 filmColor=max(0,LiquidColor.rgb)*wearLighting;
+    liquidAlpha*=1+VisualSurface.y; surfaceLight*=1+VisualSurface.y;
+    glassHighlight*=(1+VisualSurface.x); reflectedLight*=(1+VisualSurface.x);
+    glassAlpha*=1+VisualSurface.z; glassHighlight*=1+VisualSurface.z; reflectedLight*=1+VisualSurface.z;
     float underAlpha=filmAlpha+liquidAlpha*(1-filmAlpha);
     float3 underColor=filmColor*filmAlpha+(liquid*liquidAlpha+surfaceLight)*(1-filmAlpha);
     float alpha=glassAlpha+underAlpha*(1-glassAlpha);
@@ -996,7 +1125,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
     DiagnosticState=lengthWet>0?1:0;
 #endif
     if(Refraction.x>0){
-        float3 viewNormal=mul(p.viewBasis,normal);
+        float3 opticalNormal=normalize(normal+(normal-normalize(p.normal))*TraceSettings.w); float3 viewNormal=mul(p.viewBasis,opticalNormal);
         viewNormal/=max(length(viewNormal),.0001);
         float2 shift=float2(viewNormal.x,-viewNormal.y)*Refraction.w*(1+LiquidEffects.y)*(.4+.6*saturate(thickness));
         // Fallout wet-film optics: coating bend plus its screen-space thickness
@@ -1066,6 +1195,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
 #ifdef DBL_ENV_PATH_TEST
         return float4(environmentWeight,alpha,0,1);
 #endif
+        if(TraceSettings.y>0 || TraceSettings.z>0)UseDownsampledScene=dot(shift,shift)>.0001?TraceSettings.z:TraceSettings.y;
         float2 target=clamp(p.position.xy+shift,Viewport.xy+.5,Viewport.xy+Viewport.zw-.5);
         #ifdef DBL_OPTICAL
         float3 tint=lerp(float3(1,1,1),float3(1,.28,.38),1-exp(-lengthWet*.10));
@@ -1080,7 +1210,7 @@ float4 PSMain(Pixel p) : SV_TARGET {
         int2 corner=int2(floor(target-.5));bool foreground=false;
         [unroll]for(int y=0;y<2;y++)[unroll]for(int x=0;x<2;x++){
             int2 pixel=clamp(corner+int2(x,y),int2(Viewport.xy),int2(Viewport.xy+Viewport.zw)-1);
-            foreground=foreground||(SceneDepth.Load(int3(pixel,0))<p.position.z-1e-5);
+            foreground=foreground||(orderedSceneDepth(SceneDepth.Load(int3(pixel,0)))<orderedSceneDepth(p.position.z)-1e-5);
         }
         if(foreground)target=p.position.xy;
 #if DBL_REFRACTION_DIAGNOSTIC

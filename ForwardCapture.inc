@@ -36,12 +36,16 @@ struct ForwardCapture {
         bool csActive=bool(bindings.csStrict);
         if(slot==0)chunk.strictUsed=false;
         if(csActive&&!chunk.strictConstants){
+            Chunk pending;
             ComPtr<ID3D11Device> device;c->GetDevice(&device);D3D11_BUFFER_DESC d{};
             d.ByteWidth=1280*perChunk;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
-            check(device->CreateBuffer(&d,nullptr,&chunk.strictConstants));d.BindFlags=D3D11_BIND_UNORDERED_ACCESS;d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-            check(device->CreateBuffer(&d,nullptr,&chunk.strictWritable));
+            check(device->CreateBuffer(&d,nullptr,&pending.strictConstants));d.BindFlags=D3D11_BIND_UNORDERED_ACCESS;d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            check(device->CreateBuffer(&d,nullptr,&pending.strictWritable));
             for(UINT i=0;i<perChunk;++i){D3D11_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_TYPELESS;v.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;v.Buffer.FirstElement=i*320;v.Buffer.NumElements=320;v.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
-                check(device->CreateUnorderedAccessView(chunk.strictWritable.Get(),&v,&chunk.strictViews[i]));}
+                check(device->CreateUnorderedAccessView(pending.strictWritable.Get(),&v,&pending.strictViews[i]));}
+            chunk.strictWritable=std::move(pending.strictWritable);
+            std::move(std::begin(pending.strictViews),std::end(pending.strictViews),std::begin(chunk.strictViews));
+            chunk.strictConstants=std::move(pending.strictConstants);
         }
         // The engine may use compute between bottle draws. Restore every touched
         // binding, including ranges, UAV counters and shader class instances.

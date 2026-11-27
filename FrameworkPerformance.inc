@@ -5,7 +5,17 @@ void LabelDraw(int token,const char* name,uintptr_t instance){
     slots[token].label=name;slots[token].instance=instance;
 }
 namespace {
+uint64_t tileEvents[2][unsigned(TileEvent::Count)]{};
+}
+void RecordTile(bool caustic,TileEvent event){
+    if(Enabled())++tileEvents[caustic][unsigned(event)];
+}
+namespace {
 uint64_t measuredFrames=0;
+struct CausticInterval {
+    uint64_t frames{},copies{},draws{};
+    double depth{},receiver{},tile{};
+} previousCaustic;
 std::map<std::string,double> profileTotals;
 std::map<uintptr_t,FrameCosts::Frame::Bottle> instanceTotals;
 void CompleteFrame(uint64_t,const FrameCosts::Frame& frame){
@@ -17,6 +27,8 @@ void CompleteFrame(uint64_t,const FrameCosts::Frame& frame){
     }
 }
 void ResetAttribution(){
+    for(auto& events:tileEvents)std::fill(std::begin(events),std::end(events),0);
+    previousCaustic={};
     measuredFrames=0;profileTotals.clear();instanceTotals.clear();costs.onComplete=CompleteFrame;
 }
 void ReportAttribution(){
@@ -49,7 +61,7 @@ struct Framework {
 } framework;
 
 bool registered=false, compactRequested=false;
-bool pageDrawn=false,hudDrawn=false,frameworkFrame=false,keyDown=false;
+bool pageDrawn=false,keyDown=false;
 unsigned trackedBottles=0;
 struct Shortcut { int key=VK_F8; bool ctrl=true,shift=false,alt=false; } shortcut;
 const auto settingsPath=std::filesystem::absolute("Data/SKSE/Plugins/DBLPerformance.ini");
@@ -105,7 +117,6 @@ void RenderHud(){
     if(!compactRequested||!focused)return;
     auto draw=framework.foreground();
     if(!draw)return;
-    hudDrawn=true;
     auto sample=ReadFrameSummary();
     auto gpu=costs.Reliable()?std::format("{:.3f} ms",sample.gpuAverage):std::string("sampling...");
     auto label=std::format("DBL   CPU {:.3f} ms   GPU {}   Bottles {}",sample.cpuAverage,gpu,trackedBottles);
@@ -113,8 +124,13 @@ void RenderHud(){
     framework.addText(draw,{16,16},0xffffffff,label.c_str(),nullptr);
 }
 void RenderPage(){
-    if(!Focused()){listening=false;return;}
     pageDrawn=true;
+    if(!Focused()){listening=false;return;}
+    auto sampleLabel=std::format("Maximum liquid trace samples: {}",traceSampleCap);
+    framework.text(sampleLabel.c_str(),nullptr);
+    if(framework.button("Decrease samples by 12",{0,0}))traceSampleCap=std::max(12,traceSampleCap-12);
+    if(framework.button("Increase samples by 12",{0,0}))traceSampleCap=std::min(192,traceSampleCap+12);
+    if(framework.button("Restore 48 samples",{0,0}))traceSampleCap=48;
     framework.checkbox("Show compact overlay",&compactRequested);
     static bool saveFailed=false;
     if(!listening){
@@ -147,9 +163,11 @@ void RenderPage(){
                           std::string("GPU timing is warming up or has insufficient valid samples."));
     line(std::format("{} tracked bottles, {} simulation updates, {} bubbles on last update",trackedBottles,updates,bubbles));
     const char* cpuNames[]{"Hook matching","Bottle CPU","Late composition","Housekeeping"};
-    const char* gpuNames[]{"Preparation and copies","Bottle draws","Late composition and copies"};
+    constexpr const char* gpuNames[]{"Preparation and copies","Bottle draws","Late composition and copies","Caustic depth copy","Caustic receiver draw","Caustic tile preparation",
+        "Shadow mask texture copy","Shell transmission draw","TMD reflection replay"};
+    static_assert(std::size(gpuNames)==gpuStages);
     for(unsigned i=0;i<4;++i)line(std::format("{}: {:.3f} ms/frame",cpuNames[i],costs.cpuFrames?costs.cpuSum[i]/costs.cpuFrames:0));
-    if(costs.Reliable())for(unsigned i=0;i<3;++i)line(std::format("GPU {}: {:.3f} ms/frame",gpuNames[i],costs.gpuSum[i]/costs.gpuFrames));
+    if(costs.Reliable())for(unsigned i=0;i<gpuStages;++i)line(std::format("GPU {}: {:.3f} ms/frame",gpuNames[i],costs.gpuSum[i]/costs.gpuFrames));
     for(unsigned i=0;i<7;++i)line(std::format("{}: {:.3f} avg / {:.3f} peak ms/update",nuka::SimulationStageNames[i],updates?sums[i]/updates:0,peaks[i]));
     line(std::format("Rest pose cache: {} hits, {} solves",bottleDetails.restHits,bottleDetails.restBuilds));
     line(std::format("GPU sample frames: {} complete, {} dropped",frame.gpuFrames,frame.droppedFrames));
@@ -157,12 +175,52 @@ void RenderPage(){
 void LogTimingSummary(){
     if(!costs.cpuFrames)return;
     ReportAttribution();
+    for(unsigned pass=0;pass<2;++pass){
+        auto& events=tileEvents[pass];
+        spdlog::info("[DBL-tile-cache] pass={} hits={} optical_rebuilds={} focus_rebuilds={} fallbacks={}",
+            pass?"caustic":"shadow",events[0],events[1],events[2],events[3]);
+        std::fill(std::begin(events),std::end(events),0);
+    }
     auto avg=ReadFrameSummary();
+    if(receiverTiming.frames){
+        static const double millisecondsPerTick=[](){
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            return 1000./frequency.QuadPart;
+        }();
+        spdlog::info("[DBL-receiver-cost] sampled_cpu_frames={} mask_validation_calls={} mask_validation_ms_per_sampled_frame={:.6f} light_matching_calls={} light_matching_ms_per_sampled_frame={:.6f}",
+            receiverTiming.frames,
+            receiverTiming.calls[0],receiverTiming.ticks[0]*millisecondsPerTick/receiverTiming.frames,
+            receiverTiming.calls[1],receiverTiming.ticks[1]*millisecondsPerTick/receiverTiming.frames);
+    }
     const double divisor=double(std::max<uint64_t>(1,costs.gpuFrames));
-    spdlog::info("[DBL-frame-cost] mode={} cpu_ms={:.3f} gpu_ms={:.3f} reliable={} prepare_ms={:.3f} draw_ms={:.3f} compose_ms={:.3f} sampled_frames={} dropped={} tracked={}",
+    constexpr unsigned depth=unsigned(GPUStage::CausticDepthCopy), receiver=unsigned(GPUStage::CausticReceiver),
+                       tile=unsigned(GPUStage::CausticTile);
+    const CausticInterval current{avg.gpuFrames,costs.gpuCalls[depth],costs.gpuCalls[receiver],
+                                  costs.gpuSum[depth],costs.gpuSum[receiver],costs.gpuSum[tile]};
+    if(current.frames>previousCaustic.frames){
+        const auto frames=current.frames-previousCaustic.frames;
+        spdlog::info("[DBL-caustic-cost] sampled_frames={} depth_copies={} receiver_draws={} depth_copy_ms={:.5f} receiver_ms={:.5f} tile_ms={:.5f}",
+            frames,current.copies-previousCaustic.copies,current.draws-previousCaustic.draws,
+            (current.depth-previousCaustic.depth)/frames,(current.receiver-previousCaustic.receiver)/frames,
+            (current.tile-previousCaustic.tile)/frames);
+        previousCaustic=current;
+    }
+    spdlog::info("[DBL-frame-cost] mode={} cpu_ms={:.3f} gpu_ms={:.3f} reliable={} prepare_ms={:.3f} draw_ms={:.3f} compose_ms={:.3f} caustic_depth_copy_ms={:.5f} caustic_receiver_ms={:.5f} caustic_tile_ms={:.5f} caustic_depth_copies={} caustic_receiver_draws={} sampled_frames={} dropped={} tracked={}",
         full?"detailed":"compact",avg.cpuAverage,avg.gpuAverage,costs.Reliable(),
         costs.gpuSum[0]/divisor,costs.gpuSum[1]/divisor,costs.gpuSum[2]/divisor,
-        avg.gpuFrames,avg.droppedFrames,trackedBottles);
+        costs.gpuSum[3]/divisor,costs.gpuSum[4]/divisor,costs.gpuSum[5]/divisor,
+        costs.gpuCalls[3],costs.gpuCalls[4],avg.gpuFrames,avg.droppedFrames,trackedBottles);
+    if(avg.gpuFrames){
+        constexpr auto mask=unsigned(GPUStage::MaskTextureCopy);
+        constexpr auto shell=unsigned(GPUStage::ShellTransmission);
+        constexpr auto replay=unsigned(GPUStage::TmdReflectionReplay);
+        spdlog::info("[DBL-optics-cost] sampled_frames={} reliable={} mask_copy_calls={} mask_copy_ms_per_sampled_frame={:.6f} shell_transmission_calls={} shell_transmission_ms_per_sampled_frame={:.6f} tmd_reflection_replay_calls={} tmd_reflection_replay_ms_per_sampled_frame={:.6f}",
+            avg.gpuFrames,costs.Reliable(),
+            costs.gpuCalls[mask],costs.gpuSum[mask]/divisor,
+            costs.gpuCalls[shell],costs.gpuSum[shell]/divisor,
+            costs.gpuCalls[replay],costs.gpuSum[replay]/divisor);
+    }
 }
 void Visibility(bool detailed,bool brief){
     if(full==detailed&&compact==brief)return;
@@ -171,12 +229,11 @@ void Visibility(bool detailed,bool brief){
     SetMode(detailed,brief);
 }
 void FrameworkEvent(int event){
-    if(event==3){pageDrawn=hudDrawn=false;} // BeforeRender
-    if(event==4){ // AfterRender: also fires after changing pages.
-        frameworkFrame=true;
-        Visibility(pageDrawn,hudDrawn&&!pageDrawn);
-    }
-    if(event==2&&full)Visibility(false,false); // CloseMenu
+    if(event==3)pageDrawn=false; // BeforeRender
+    // The HUD may miss a draw when another window takes focus. Keep timing
+    // tied to the requested mode, including frames without framework events.
+    if(event==4)Visibility(pageDrawn,compactRequested&&!pageDrawn);
+    if(event==2&&full)Visibility(false,compactRequested);
 }
 template<class T> bool Bind(HMODULE module,T& target,const char* name){
     target=reinterpret_cast<T>(GetProcAddress(module,name));
@@ -206,14 +263,14 @@ void RegisterFramework(){
 }
 void Present(IDXGISwapChain*,unsigned instances,bool){
     if(!registered)return;
-    if(!frameworkFrame)Visibility(false,false);
-    frameworkFrame=false;
     if(!Enabled())return;
     trackedBottles=instances;
     CloseQueryFrame();
     Poll();
     static const double milliseconds=[](){LARGE_INTEGER f;QueryPerformanceFrequency(&f);return 1000./f.QuadPart;}();
     for(unsigned i=0;i<4;++i){costs.CPU(i,cpuClock.ticks[i]*milliseconds);cpuClock.ticks[i]=0;}
+    if(receiverTiming.sampled)++receiverTiming.frames;
     costs.Seal();
+    receiverTiming.sampled=costs.Selected();
     if(costs.cpuFrames%300==0)LogTimingSummary();
 }

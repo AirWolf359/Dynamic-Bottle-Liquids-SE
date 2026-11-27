@@ -50,11 +50,12 @@ struct OpticalBuffers {
     ComPtr<ID3D11DepthStencilView> nearestDS;
     ComPtr<ID3D11ShaderResourceView> background,finalDepth;
     ComPtr<ID3D11PixelShader> producer,composePS;ComPtr<ID3D11VertexShader> composeVS;
-    ComPtr<ID3D11BlendState> opaque;ComPtr<ID3D11DepthStencilState> nearest,noDepth;
+    ComPtr<ID3D11BlendState> opaque;ComPtr<ID3D11DepthStencilState> nearest,reverseNearest,noDepth;
     ComPtr<ID3D11RasterizerState> screenRaster;ComPtr<ID3D11SamplerState> linear;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11RenderTargetView> preparedRT;ComPtr<ID3D11DepthStencilView> preparedDS;
     UINT width{},height{};DXGI_FORMAT format{};uint64_t prepared=~0ull,composed=~0ull;unsigned draws{};bool failed=false,boundaryMissing=false;
+    bool preparedReverse=false;
     D3D11_VIEWPORT producerViewport{};
     unsigned hdrAttempts{},hdrVerified{},hdrBoundMismatch{};
     void initialize(ID3D11Device* device,const std::filesystem::path& shaderPath){
@@ -73,26 +74,40 @@ struct OpticalBuffers {
         code=compile(path,"PS","ps_5_0",nullptr);check(device->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&composePS));
         D3D11_BLEND_DESC bd{};for(auto& t:bd.RenderTarget)t.RenderTargetWriteMask=15;check(device->CreateBlendState(&bd,&opaque));
         D3D11_DEPTH_STENCIL_DESC dd{};dd.DepthEnable=true;dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL;check(device->CreateDepthStencilState(&dd,&nearest));
+        dd.DepthFunc=D3D11_COMPARISON_GREATER_EQUAL;check(device->CreateDepthStencilState(&dd,&reverseNearest));
         dd.DepthEnable=false;dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;check(device->CreateDepthStencilState(&dd,&noDepth));
         D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=true;check(device->CreateRasterizerState(&rd,&screenRaster));
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;check(device->CreateSamplerState(&sd,&linear));
     }
-    bool prepare(ID3D11DeviceContext* ctx,uint64_t currentFrame,V4& info,V4& viewport){
-        if(failed||boundaryMissing||!producer||composed==currentFrame||ctx->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
-        ComPtr<ID3D11RenderTargetView> rt;ComPtr<ID3D11DepthStencilView> ds;ctx->OMGetRenderTargets(1,&rt,&ds);if(!rt||!ds)return false;
+    bool prepare(ID3D11DeviceContext* ctx,ID3D11RenderTargetView* verifiedMain,uint64_t currentFrame,V4& info,V4& viewport,
+                 bool reverseTarget=false,bool replayNow=false){
+        // The caller verifies MAIN by resource identity. Bindings still have to
+        // match that verified view when this draw enters the queue.
+        if(!verifiedMain||failed||boundaryMissing!=replayNow||!producer||composed==currentFrame||
+           ctx->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
+        if(replayNow&&(!reverseTarget||!forwardDraws.optimized))return false;
+        if((reverseTarget&&!forwardDraws.enabled)||(prepared==currentFrame&&preparedReverse!=reverseTarget))return false;
+        ComPtr<ID3D11RenderTargetView> rt;ComPtr<ID3D11DepthStencilView> ds;
+        ctx->OMGetRenderTargets(1,&rt,&ds);if(rt.Get()!=verifiedMain||!ds)return false;
         // Views are immutable. Retain references so pointer identity cannot be reused.
         // Still validate context, frame, target identity and current viewport.
         if(prepared==currentFrame&&context.Get()==ctx&&preparedRT==rt&&preparedDS==ds){
             UINT count=1;D3D11_VIEWPORT vp{};ctx->RSGetViewports(&count,&vp);
             if(count!=1||vp.TopLeftX!=0||vp.TopLeftY!=0||vp.Width!=width||vp.Height!=height||vp.MinDepth<0||vp.MaxDepth>1||vp.MaxDepth<=vp.MinDepth)return false;
-            info={1,float(width),float(height),4};viewport={0,0,float(width),float(height)};return true;
+            info={reverseTarget?2.f:1.f,float(width),float(height),4};viewport={0,0,float(width),float(height)};return true;
         }
         D3D11_RENDER_TARGET_VIEW_DESC rv{};rt->GetDesc(&rv);
         D3D11_DEPTH_STENCIL_VIEW_DESC dv{};ds->GetDesc(&dv);
-        if(rv.Format!=DXGI_FORMAT_R11G11B10_FLOAT||rv.ViewDimension!=D3D11_RTV_DIMENSION_TEXTURE2D||rv.Texture2D.MipSlice||dv.ViewDimension!=D3D11_DSV_DIMENSION_TEXTURE2D||dv.Texture2D.MipSlice)return false;
+        const bool hdrColor=rv.Format==DXGI_FORMAT_R11G11B10_FLOAT||
+            (reverseTarget&&rv.Format==DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if(!hdrColor||rv.ViewDimension!=D3D11_RTV_DIMENSION_TEXTURE2D||rv.Texture2D.MipSlice||dv.ViewDimension!=D3D11_DSV_DIMENSION_TEXTURE2D||dv.Texture2D.MipSlice)return false;
         DXGI_FORMAT depthFormat=DXGI_FORMAT_UNKNOWN;
-        if(dv.Format==DXGI_FORMAT_D24_UNORM_S8_UINT)depthFormat=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        if(dv.Format==DXGI_FORMAT_D32_FLOAT)depthFormat=DXGI_FORMAT_R32_FLOAT;
+        if(reverseTarget){
+            if(dv.Format==DXGI_FORMAT_D32_FLOAT_S8X24_UINT)depthFormat=DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        }else{
+            if(dv.Format==DXGI_FORMAT_D24_UNORM_S8_UINT)depthFormat=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            if(dv.Format==DXGI_FORMAT_D32_FLOAT)depthFormat=DXGI_FORMAT_R32_FLOAT;
+        }
         if(depthFormat==DXGI_FORMAT_UNKNOWN)return false;
         ComPtr<ID3D11Resource> cr,dr;rt->GetResource(&cr);ds->GetResource(&dr);
         ComPtr<ID3D11Texture2D> ct,dt;if(FAILED(cr.As(&ct))||FAILED(dr.As(&dt)))return false;
@@ -112,8 +127,8 @@ struct OpticalBuffers {
             privateDepth.Reset();nearestDS.Reset();D3D11_TEXTURE2D_DESC d{};d.Width=width;d.Height=height;d.MipLevels=d.ArraySize=1;d.Format=DXGI_FORMAT_D32_FLOAT;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL;check(device->CreateTexture2D(&d,nullptr,&privateDepth));check(device->CreateDepthStencilView(privateDepth.Get(),nullptr,&nearestDS));
         }
         sourceColor=ct;sourceDepth=dt;context=ctx;preparedRT=rt;preparedDS=ds;
-        if(prepared!=currentFrame){{dblui::GPUCost timing(ctx,dblui::GPUStage::Prepare);float zero[4]{};if(!forwardDraws.enabled){ctx->ClearRenderTargetView(light.rt.Get(),zero);ctx->ClearRenderTargetView(transmission.rt.Get(),zero);ctx->ClearRenderTargetView(distortion.rt.Get(),zero);}ctx->ClearDepthStencilView(nearestDS.Get(),D3D11_CLEAR_DEPTH,1,0);}prepared=currentFrame;hdrAttempts=hdrVerified=hdrBoundMismatch=0;draws=0;forwardDraws.clear();producerViewport=vp;}
-        info={1,float(width),float(height),4};viewport={0,0,float(width),float(height)};return true;
+        if(prepared!=currentFrame){{dblui::GPUCost timing(ctx,dblui::GPUStage::Prepare);float zero[4]{};if(!forwardDraws.enabled){ctx->ClearRenderTargetView(light.rt.Get(),zero);ctx->ClearRenderTargetView(transmission.rt.Get(),zero);ctx->ClearRenderTargetView(distortion.rt.Get(),zero);}ctx->ClearDepthStencilView(nearestDS.Get(),D3D11_CLEAR_DEPTH,reverseTarget?0.f:1.f,0);}prepared=currentFrame;preparedReverse=reverseTarget;hdrAttempts=hdrVerified=hdrBoundMismatch=0;draws=0;forwardDraws.clear();producerViewport=vp;}
+        info={reverseTarget?2.f:1.f,float(width),float(height),4};viewport={0,0,float(width),float(height)};return true;
     }
     void produce(ID3D11DeviceContext* ctx,DrawFn draw,UINT count,UINT start,INT base,const GPU* bottleData=nullptr,const char* name=nullptr,uintptr_t instance=0){
         if(forwardDraws.enabled){forwardDraws.capture(ctx,count,start,base,bottleData,nullptr,name,instance);++draws;return;}
@@ -122,6 +137,15 @@ struct OpticalBuffers {
         ctx->OMSetRenderTargets(3,targets,nearestDS.Get());ctx->PSSetShader(producer.Get(),nullptr,0);
         ctx->OMSetBlendState(opaque.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(nearest.Get(),0);
         {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,name,instance);draw(ctx,count,start,base);}++draws;
+    }
+    void replayPreparedForward(){
+        // Immediate replays can see different MAIN pixels in the same frame.
+        if(boundaryMissing)forwardDraws.snapshot.blur.invalidate();
+        auto* depthState=preparedReverse?reverseNearest.Get():nearest.Get();
+        forwardDraws.draw(context.Get(),oldDraw,preparedRT.Get(),preparedDS.Get(),nearestDS.Get(),opaque.Get(),
+                         depthState,producerViewport,preparedReverse);
+        forwardDraws.clear();
+        draws=0;
     }
     bool compose(uint64_t currentFrame,ID3D11Resource* verifiedHDRScene=nullptr){
         if(prepared!=currentFrame||!draws||composed==currentFrame||!context)return false;
@@ -135,8 +159,8 @@ struct OpticalBuffers {
         // OM state. An explicitly different scene must never authorize replay.
         if(verifiedHDRScene ? verifiedHDRScene!=sourceColor.Get() : resource.Get()!=sourceColor.Get())return false;
         if(forwardDraws.enabled){
-            forwardDraws.draw(ctx,oldDraw,preparedRT.Get(),preparedDS.Get(),nearestDS.Get(),opaque.Get(),nearest.Get(),producerViewport);
-            composed=currentFrame;forwardDraws.clear();return true;
+            replayPreparedForward();
+            composed=currentFrame;return true;
         }
         OpticalState saved(ctx);blur.build(ctx,background.Get(),finalDepth.Get(),sourceColor.Get(),width,height);ID3D11ShaderResourceView* none[16]{};ctx->PSSetShaderResources(0,16,none);
         auto* target=output.rt.Get();ctx->OMSetRenderTargets(1,&target,nullptr);

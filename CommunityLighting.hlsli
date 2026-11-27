@@ -40,7 +40,8 @@ float3 csDirectional(float3 v){
 uint2 csCluster(float4 pixel){
     uint count,stride;CSGrid.GetDimensions(count,stride);
     float z=max(CSCamera.w/max(CSCamera.x-pixel.z*CSCamera.z,1e-6),CSCamera.y);
-    float2 uv=(pixel.xy-Viewport.xy)/max(Viewport.zw,1);
+    // Direct liquid draws can skip the optics capture that fills Viewport.
+    float2 uv=all(Viewport.zw>0)?(pixel.xy-Viewport.xy)/Viewport.zw:pixel.xy*CSBufferDim.zw;
     uint3 cell=uint3(uv*CSClusterSize.xy,log(z/max(CSCamera.y,1e-6))*CSClusterSize.z/log(max(CSCamera.x/CSCamera.y,1.0001)));
     if(any(cell>=CSClusterSize.xyz))return 0;
     uint index=cell.x+CSClusterSize.x*(cell.y+CSClusterSize.y*cell.z);
