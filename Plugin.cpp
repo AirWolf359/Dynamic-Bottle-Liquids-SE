@@ -581,8 +581,7 @@ struct FittingSample {
 // positions and one world matrix per eye.
 constexpr UINT fittingLightingRegisters=vrStereo?49:30;
 constexpr UINT fittingPoseRegisters=vrStereo?6:3;
-// Skyrim VR: log once why a fitting's lighting wasn't borrowed, so the VR path
-// can be checked in game.
+// Skyrim VR: log once per reason why a fitting's lighting wasn't borrowed.
 void ReportFittingCapture(const char* reason){
     if constexpr(vrStereo){
         static std::unordered_set<std::string_view> reported;
@@ -635,7 +634,9 @@ void ObserveBottleFitting(RE::BSRenderPass* pass){
         const std::string_view tag=bottle->name.c_str();
         if(!tag.starts_with("DBL_SSE_Skyking_")&&!tag.starts_with("DBL_SSE_ElSopa_")&&!tag.starts_with("DBL_SSE_Mega_ElSopa"))continue;
         const auto* target=FindBottleProfile(profiles,bottle->name.c_str());
-        if(target&&target->nativeGlassPrototype){fittingBottle=bottle;fittingGeometry=g;return;}
+        if(target&&target->nativeGlassPrototype){
+            fittingBottle=bottle;fittingGeometry=g;return;
+        }
     }
 }
 ComPtr<ID3D11ShaderResourceView> NativeSunShadow(ID3D11DeviceContext*,bool);
@@ -650,7 +651,7 @@ void CaptureFitting(ID3D11DeviceContext* ctx,const RE::BSGeometry* bottle,RE::BS
         ReportFittingCapture("the fitting's draw has no shadow mask at t14");return;
     }
     auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->properties[1].get());
-    if(!prop||!prop->material)return;
+    if(!prop||!prop->material){ReportFittingCapture("the fitting has no lighting material");return;}
     ComPtr<ID3D11DeviceContext1> cx;ctx->QueryInterface(IID_PPV_ARGS(&cx));
     ComPtr<ID3D11Buffer> src;
     UINT first=0,count=0;
@@ -1033,6 +1034,7 @@ using DrawInstancedFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT,UI
 struct InstancedCall{DrawInstancedFn original;UINT instances,startInstance;};
 thread_local const InstancedCall* instancedCall=nullptr;
 void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original);
+void CaptureVRFittingDraw(ID3D11DeviceContext* ctx,UINT count);
 bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder) {
     if(!distanceTuning.renderer||!active||!profile)return false;
     auto* g=active->geometry;
@@ -1332,9 +1334,11 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
                     }
                     gpu.fittingColor.w=fitting->local?relative.scale:-1.f;
                     if constexpr(vrStereo){
-                        static std::unordered_set<std::string> reportedVR;
-                        if(reportedVR.emplace(g->name.c_str()).second)
-                            SKSE::log::info("[DBL-VR-fitting] Borrowed fitting lighting for {} (pose {}, {} space)",g->name.c_str(),fitting->pose?"verified":"not verified",fitting->local?"model":"world");
+                        static bool reportedVR=false;
+                        if(!reportedVR){
+                            reportedVR=true;
+                            SKSE::log::info("[DBL-VR-fitting] Fitting lighting active, first on {}",g->name.c_str());
+                        }
                     }
                 }
             }
@@ -1526,6 +1530,19 @@ bool QueueTmdReflection(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base)
     }
     return captured||!visible;
 }
+// Read a cork or fitting draw's lighting for its bottle (ElSopa, Skyking).
+__forceinline void CaptureFittingDraw(ID3D11DeviceContext* ctx,UINT count){
+    if(!distanceTuning.renderer)return;
+    const bool registered=!elSopaFittings.empty()&&CaptureSubmittedFitting(ctx,count);
+    if(!registered&&fittingBottle)CaptureFitting(ctx,fittingBottle,fittingGeometry,false);
+}
+// Skyrim VR: the stereo hook only routes bottle draws to DBL, so a fitting's
+// draw comes here to have its lighting read, then is submitted unchanged.
+void CaptureVRFittingDraw(ID3D11DeviceContext* ctx,UINT count){
+    if(!fittingBottle&&elSopaFittings.empty())return;
+    dblui::CPUCost cpuCost(dblui::CPUStage::Bottles);
+    CaptureFittingDraw(ctx,count);
+}
 // The bottle path shared by SE's DrawIndexed hook and Skyrim VR's instanced
 // stereo draw (DrawBottleInstanced).
 __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
@@ -1534,10 +1551,7 @@ __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT
         // Keep every rejection timed, but avoid entering the large renderer
         // stack frame for unrelated engine draws. Native draw time stays out.
         dblui::CPUCost cpuCost(dblui::CPUStage::Bottles);
-        if(distanceTuning.renderer){
-            const bool registered=!elSopaFittings.empty()&&CaptureSubmittedFitting(ctx,count);
-            if(!registered&&fittingBottle)CaptureFitting(ctx,fittingBottle,fittingGeometry,false);
-        }
+        CaptureFittingDraw(ctx,count);
         if(distanceTuning.renderer&&active&&profile){
             handled=TryRenderBottle(ctx,count,start,base,glassOrder);
         }
