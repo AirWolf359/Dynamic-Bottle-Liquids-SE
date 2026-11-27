@@ -2,11 +2,27 @@
 
 Dynamic Bottle Liquids SE animates liquid inside Skyrim Special Edition bottles. Tilt or shake a supported bottle to see the liquid shift, form waves and carry bubbles to the surface.
 
-**Version 1.0.0** supports the Steam runtimes 1.5.97, 1.6.1170 and 1.7.104.
+**Version 1.1.0** supports the Steam runtimes 1.5.97, 1.6.1170 and 1.7.104.
 
 **[Download the mod and compatibility patches on Nexus Mods](https://www.nexusmods.com/games/skyrimspecialedition/mods/199666)**
 
 Install the runtime with the matching SKSE and Address Library. Install compatibility patches after DBL and the bottle replacers they target.
+
+The 1.1.0 core includes the vanilla bottle meshes based on Assorted Mesh Fixes. For vanilla bottles, leave **General Potion Replacers** on **Skip**. If you use RUSTIC ANIMATED POTIONS and POISONS, select it directly on that page.
+
+For Unified Potions PBR, XMead PBR Clear, or Destrier Wine PBR, rerun PG Patcher after installing the DBL patch. Give the DBL meshes priority among PG Patcher's inputs, then let the generated output overwrite the DBL patch.
+
+## What's new in 1.1.0
+
+- Reduced shadow and caustic preparation when the native renderer can verify which lights reach a bottle.
+- Refitted liquid cavities across supported bottle replacers, including TMD Winery, XMead, and ElSopa.
+- Corrected ElSopa and Xtudo no-emission variants and added moving liquid to the Zerofrost models for Esbern's Potion, Sleeping Tree Sap, and Soul Husk Extract.
+
+With Light Placer and CS Light or another configuration pack, choose **Emission** for ElSopa or Medieval Potions and **Original glow only** for Skyking. RUSTIC retains its original animated glow. Light placement depends on the enabled rules and the winning models.
+
+## Shader compatibility
+
+Reverse-Z detection was verified with Open Shaders 2.23.1 on Skyrim 1.6.1170 with InverseZ enabled.
 
 ## Optional performance overlay
 
