@@ -17,6 +17,8 @@ void hdrRender(RE::ImageSpaceEffect* effect,RE::BSTriShape* shape,RE::ImageSpace
     {dblui::CPUCost compositionCPU(dblui::CPUStage::Compose);
     try{
         auto* mainScene=verifiedHDRMain(effect);
+        if(mainScene)if(auto* renderer=RE::BSGraphics::Renderer::GetRendererData())
+            tmdReflections.DrawPending(reinterpret_cast<ID3D11DeviceContext*>(renderer->context),mainScene,nullptr);
         if(opticalBuffers.observeHDRBoundary(frame,mainScene!=nullptr))SKSE::log::info("[DBL-HDR-recovered] Verified MAIN boundary returned; shared rendering resumes next frame");
         if(opticalBuffers.prepared==frame&&opticalBuffers.draws&&opticalBuffers.composed!=frame){
             // Replay reports copies/draws itself; do not count them twice.
@@ -31,7 +33,7 @@ void hdrRender(RE::ImageSpaceEffect* effect,RE::BSTriShape* shape,RE::ImageSpace
             }
         }
     }catch(const std::exception& e){
-        if(forwardDraws.enabled){forwardDraws.enabled=false;opticalBuffers.reset();SKSE::log::error("Forward resolve failed; restoring Test68 optical buffers next frame: {}",e.what());}
+        if(forwardDraws.enabled){forwardDraws.enabled=false;opticalBuffers.reset();SKSE::log::error("Forward resolve failed; using separate optical buffers next frame: {}",e.what());}
         else {opticalBuffers.failed=true;SKSE::log::error("Late optical composition failed; immediate fallback from next frame: {}",e.what());}
     }
     }

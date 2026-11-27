@@ -16,11 +16,20 @@
 #include "PerformanceUI.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <optional>
+#include <span>
 #include "DistanceTuning.h"
 #include "FillHeightTuning.h"
 #include "ProfileLookup.h"
 #include "LayeredProfiles.h"
+#include "TmdReflectionReplay.h"
+#include "NativePointShadowAtlas.h"
+#include "TmdShellCoverage.h"
+#include "ProjectionLightChecks.h"
 #include <chrono>
+#ifdef DBL_DEVELOPMENT
+#include <atomic>
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <cctype>
@@ -31,14 +40,20 @@ using Microsoft::WRL::ComPtr;
 #include "LiquidTextureSlosh.h"
 using nuka::Vec; using nuka::V4;
 const std::filesystem::path root=L"Data/SKSE/Plugins/SkyrimBottlePrototype";
-struct Profile { float designedFill=0;double designedHeight=0; nuka::Settings settings; V4 color; UINT indices; nuka::Constants distant{};
-    float glassOpacity=.40f,nativeFrontGlassOpacity=0,liquidAlphaOverride=0,liquidPointLightScattering=1;
-    bool liquidOnly=false,disableLiquidRefraction=false,nativeGlassPrototype=false,nativeLiquidDepth=false,directNativeLiquid=false;
-    bool colorlessGlass=false; int refractionMip=0; float liquidTexture=0; bool liquidNativeUV=false,liquidTextureTint=false,liquidTextureUnmirrored=false; float liquidEmission=0,glassRefractionScale=1; bool independentLiquidAnimation=false,bulkLiquidTexture=false; std::array<double,2> liquidScrollRate{}; V4 liquidTextureRect{0,0,1,1}; };
+#include "VisualValues.h"
+struct Profile { VisualValues visual; float designedFill=0;double designedHeight=0; nuka::Settings settings; V4 color; UINT indices; nuka::Constants distant{};
+    float glassOpacity=.40f,nativeFrontGlassOpacity=0,liquidAlphaOverride=0,liquidPointLightScattering=1,liquidInteriorPointLightScattering=1;
+    bool shieldWetParticles=false,liquidOnly=false,nativeGlassPrototype=false,nativeLiquidDepth=false;
+    bool LiquidOpaque() const {return liquidAlphaOverride==1.f;}
+    bool DirectNativeLiquid() const {return nativeGlassPrototype&&LiquidOpaque();}
+    bool authoredGlass=false;
+    bool nativeLiquidGlow=false; bool colorlessGlass=false; int refractionMip=0; float liquidTexture=0; bool liquidNativeUV=false,liquidTextureTint=false,liquidTextureUnmirrored=false; V4 emissionColor{}; float liquidEmission=0,glassRefractionScale=1; bool independentLiquidAnimation=false,bulkLiquidTexture=false; std::array<double,2> liquidScrollRate{}; V4 liquidTextureRect{0,0,1,1}; V4 rusticMapping{}; };
 std::unordered_map<std::string,Profile,ProfileNameHash,std::equal_to<>> profiles;
 struct Instance { LiquidTextureSlosh textureSlosh; LiquidTextureAnimation liquidScroll; RE::NiPointer<RE::BSGeometry> owner; nuka::Motion motion; BubbleMotion emission; TranslationMotion translation; Vec position{}; double time{}; uint64_t frame=~0ull,nativeGlassFrame=~0ull; nuka::Constants constants; bool distant=false; SimulationSchedule schedule; nuka::Constants previous{}; Vec observedUp{},observedRight{}; float previousClock=0;
     nuka::BubbleBudgetRequest bubbleRequest;
     nuka::BubbleLimits bubbleQuota{0,0,0};uint64_t bubbleSeen=~0ull;
+    uint64_t projectionSeen=~0ull;float projectionDistance{};
+    const RE::BSLight* projectionLight{};uint64_t projectionLightFrame=~0ull;
     Instance(){motion.bubbleLimits={0,0,0};}
     const Profile* restingProfile=nullptr;Vec restingUp{};V4 restingPlane{};
     float restingFill=-1;unsigned restingBuilds=0;
@@ -72,11 +87,11 @@ void AllocateBubbleQuotas(uint64_t currentFrame){
     nuka::AllocateSceneBubbles(requests);
     for(auto& [geometry,i]:instances){
         nuka::ApplyBubbleLimits(i.motion,i.bubbleQuota);
-        LimitCachedBubbles(i.constants,i.bubbleQuota);LimitCachedBubbles(i.previous,i.bubbleQuota);
+        LimitCachedBubbles(i.constants,i.bubbleQuota);
+        LimitCachedBubbles(i.previous,i.bubbleQuota);
     }
 }
 DistanceTuning distanceTuning;
-
 uint64_t frame=0;
 #ifdef DBL_SKYRIM_VR
 constexpr bool vrStereo=true;  // Skyrim VR instanced stereo build
@@ -92,12 +107,29 @@ thread_local RE::BSRenderPass* active=nullptr;
 thread_local Profile* profile=nullptr;
 using GeometryFn=void(*)(RE::BSShader*,RE::BSRenderPass*,uint32_t);
 GeometryFn oldSetup{},oldRestore{};
+GeometryFn oldUtilitySetup{},oldUtilityRestore{};
+thread_local const RE::BSRenderPass* utilityPass=nullptr;
 using DrawFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT,INT);
-DrawFn oldDraw{};
+struct IndexedDrawHook {
+    void* target{};
+    DrawFn original{};
+};
+std::array<IndexedDrawHook,4> indexedDrawHooks;
+thread_local DrawFn indexedDrawOriginal=nullptr;
+void STDMETHODCALLTYPE oldDraw(ID3D11DeviceContext*,UINT,UINT,INT);
+void STDMETHODCALLTYPE PassThroughDraw(ID3D11DeviceContext*,UINT,UINT,INT);
+TmdReflectionReplay tmdReflections([](ID3D11DeviceContext* ctx,ID3D11CommandList* commands){
+    dblui::GPUCost timing(ctx,dblui::GPUStage::TmdReflectionReplay);
+    ctx->ExecuteCommandList(commands,TRUE);
+});
+thread_local RE::BSGeometry* tmdReflectionBody=nullptr;
+thread_local const RE::BSLight* tmdReflectionPoint=nullptr;
 using PresentFn=HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*,UINT,UINT);
 PresentFn oldPresent{};
 ComPtr<ID3D11VertexShader> vs;
-ComPtr<ID3D11PixelShader> ps,nativeDepthPS;
+ComPtr<ID3D11PixelShader> ps,nativeDepthPS,shellOpticsPS,shellCoveragePS;
+ComPtr<ID3D11Buffer> shellOpticsBuffer;
+thread_local float shellBend=0; thread_local int shellMip=0;
 
 ComPtr<ID3D11InputLayout> layout;
 ComPtr<ID3D11Buffer> buffer;
@@ -105,8 +137,8 @@ ComPtr<ID3D11BlendState> blend;
 ComPtr<ID3D11DepthStencilState> depth,liquidDepthWrite;
 
 ComPtr<ID3D11RasterizerState> raster;
-struct alignas(16) GPU { V4 eye,plane,wave,detail,color,glass; V4 rings[16]; V4 bounds,refraction,viewport; V4 bubbleInfo,bubbles[64]; V4 wetInfo,wetFilm[64]; V4 cavityPlanes[16]; V4 surfaceBubbles[64]; V4 surfacePop[16]; V4 tunedModes[3],tunedInfo; V4 rippleWeights{1,0,.4535961214f,.8912073601f}; V4 effectWeights[5]{{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1}}; V4 appearance{.40f,0,0,0}; V4 viscousSurface{}; V4 authoredSpec{1,1,1,80}; V4 liquidMaterial{}; V4 liquidTextureRect{0,0,1,1}; V4 liquidAnimation{0,0,1,1}; V4 liquidEffects{}; V4 liquidIndependentAnimation{0,0,1,1}; V4 liquidTexturePlane{0,0,1,0}; };
-static_assert(sizeof(GPU)==4320);
+struct alignas(16) GPU { V4 eye,plane,wave,detail,color,glass; V4 rings[16]; V4 bounds,refraction,viewport; V4 bubbleInfo,bubbles[64]; V4 wetInfo,wetFilm[64]; V4 cavityPlanes[16]; V4 surfaceBubbles[64]; V4 surfacePop[16]; V4 tunedModes[3],tunedInfo; V4 rippleWeights{1,0,.4535961214f,.8912073601f}; V4 effectWeights[5]{{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1}}; V4 appearance{.40f,0,0,0}; V4 viscousSurface{}; V4 authoredSpec{1,1,1,80}; V4 liquidMaterial{}; V4 liquidTextureRect{0,0,1,1}; V4 liquidAnimation{0,0,1,1}; V4 liquidEffects{}; V4 liquidIndependentAnimation{0,0,1,1}; V4 liquidTexturePlane{0,0,1,0}; V4 fittingPosition{},fittingColor{},fittingRows[3]{},emissionColor{},traceSettings{},visualLight{},visualSurface{},rusticMapping{}; };
+static_assert(sizeof(GPU)==4480);
 void rippleGPU(GPU& g,double seconds,float viscosity=0){
     constexpr double tau=6.283185307179586;
     const auto response=nuka::Viscosity(viscosity);
@@ -139,17 +171,22 @@ void BeginBubbleFrame(ID3D11DeviceContext* ctx){
         SKSE::log::info("[DBL-bubble-budget] maximum=1280 reserved={} retained={} cached={} tracked={}",reserved,live,packed,instances.size());
     }
 }
-bool GrabbedBottle(const RE::NiAVObject* object){
-    if(!grabbedBottleRoot)return false;
-    for(unsigned depth=0;object&&depth<128;object=object->parent,++depth)if(object==grabbedBottleRoot.get())return true;
+bool InBottleTree(const RE::NiAVObject* object,const RE::NiAVObject* root){
+    if(!root)return false;
+    for(unsigned depth=0;object&&depth<128;object=object->parent,++depth)if(object==root)return true;
     return false;
 }
+bool GrabbedBottle(const RE::NiAVObject* object){return InBottleTree(object,grabbedBottleRoot.get());}
+
 void check(HRESULT hr) { if(FAILED(hr)) throw std::runtime_error(std::format("D3D HRESULT {:08X}",uint32_t(hr))); }
 #include "RippleTexture.h"
 RippleTexture rippleTexture;
+#include "RefractionCamera.inc"
 #include "SharedBlur.inc"
 #include "Refraction.inc"
 #include "OpticalBuffers.inc"
+#include "BottleProjection.inc"
+#include "NativeOpaqueShadow.inc"
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 Vec localDirection(const RE::NiTransform& t,Vec p) {
     auto& r=t.rotate.entry;
@@ -175,15 +212,20 @@ void loadProfiles(const std::filesystem::path& path=root/"profiles.json",bool pr
         const auto name=item.at("name").get<std::string>();
         try{
         Profile p{};p.refractionMip=std::clamp(item.value("refraction_mip",item.value("downsample_refraction",false)?2:0),0,4); auto& s=p.settings;s.previewTuning=previewTuning;
+        s.base.viscousSurface.w=name.starts_with("DBL_SSE_Skyking_")?.5f:0.f;
         s.viscosity=item.value("viscosity",0.f);
         if(!std::isfinite(s.viscosity)||s.viscosity<0||s.viscosity>100)throw std::runtime_error("Invalid viscosity");
         s.fill=item.at("fill"); p.designedFill=s.fill; s.frequency=1.6f; s.damping=.24f; s.gain=1.2f; s.maxTilt=.4f;
         s.waveAmplitude=.28f; s.waveFrequency=.65f; s.settle=.7f; s.shakingBubbles=1; s.base.wetTuning.w=1.2f;
         s.foamStrength=1;s.intensity=1;s.surfaceLifetimeJitter=1.f;
         s.surfaceLifetime=MeadSurfaceProfile(name)?7.f:2.f;
-        s.base.ringCount=int(item.at("rings").size());
-        if(s.base.ringCount<2||s.base.ringCount>16)throw std::runtime_error("Invalid rings");
-        for(int i=0;i<s.base.ringCount;i++) s.base.rings[i]={item["rings"][i][0],item["rings"][i][1],0,0};
+        const auto& rings=item.at("rings");
+        if(!rings.is_array()||rings.size()<2||rings.size()>16)throw std::runtime_error("Invalid rings");
+        s.base.ringCount=int(rings.size());
+        for(int i=0;i<s.base.ringCount;i++){
+            const auto& ring=rings.at(i);
+            s.base.rings[i]={ring.at(0),ring.at(1),0,0};
+        }
         // Binary profile lookup requires strictly ascending finite ring heights.
         for(int i=0;i<s.base.ringCount;++i)if(!std::isfinite(s.base.rings[i].x)||!std::isfinite(s.base.rings[i].y)||s.base.rings[i].y<0||(i&&s.base.rings[i].x<=s.base.rings[i-1].x))
             throw std::runtime_error("Invalid cavity profile: rings must be finite, nonnegative and strictly height-sorted");
@@ -191,8 +233,11 @@ void loadProfiles(const std::filesystem::path& path=root/"profiles.json",bool pr
         for(int i=0;i<s.base.ringCount;++i)s.base.rings[0].z=std::max(s.base.rings[0].z,s.base.rings[i].y);
         if(item.contains("cavity_shape")){
             const auto& shape=item.at("cavity_shape");const auto& planes=shape.at("planes");
-            if(planes.size()<3||planes.size()>16)throw std::runtime_error("Invalid cavity polygon");
-            for(size_t i=0;i<planes.size();++i)s.base.cavityPlanes[i]={planes[i][0],planes[i][1],0,0};
+            if(!planes.is_array()||planes.size()<3||planes.size()>16)throw std::runtime_error("Invalid cavity polygon");
+            for(size_t i=0;i<planes.size();++i){
+                const auto& plane=planes.at(i);
+                s.base.cavityPlanes[i]={plane.at(0),plane.at(1),0,0};
+            }
             s.base.cavityPlanes[0].z=shape.at("radius_scale");s.base.cavityPlanes[0].w=float(planes.size());
         }
         // Roughly one primary crest/trough across the body, with proportional height.
@@ -206,15 +251,20 @@ void loadProfiles(const std::filesystem::path& path=root/"profiles.json",bool pr
         float responseScale=std::clamp(float(std::pow(std::max(volume*s.fill,1.0)/200.0,1.0/6.0)),.8f,1.6f);
         s.frequency=1.25f/responseScale;s.damping=.11f;
         s.broadWaveDecay=2.0f*responseScale;s.waveTimeScale=.85f/responseScale;
-        p.color={item["color"][0],item["color"][1],item["color"][2],item.value("extinction",.32f)}; p.indices=item.at("indices");
+        const auto& color=item.at("color");
+        p.color={color.at(0),color.at(1),color.at(2),item.value("extinction",.32f)}; p.indices=item.at("indices");
         p.glassOpacity=item.value("glass_opacity",.40f);p.liquidOnly=item.value("liquid_only",false);
         p.nativeGlassPrototype=item.value("native_glass_prototype",false);
         p.nativeLiquidDepth=item.value("native_liquid_depth",false);
+        p.authoredGlass=item.value("authored_glass",false);
+        if(p.authoredGlass&&!p.nativeGlassPrototype)throw std::runtime_error("Authored glass requires native glass");
+        p.shieldWetParticles=p.nativeGlassPrototype&&!p.authoredGlass&&name.starts_with("DBL_SSE_TMDWinery_");
         if(p.nativeGlassPrototype&&!p.liquidOnly)throw std::runtime_error("Native glass requires liquid-only rendering");
         auto liquidOpacity=item.value("liquid_opacity",0.f);
         if(!std::isfinite(liquidOpacity)||liquidOpacity<0||liquidOpacity>1)throw std::runtime_error("Invalid liquid opacity");
         p.colorlessGlass=item.value("colorless_glass",false);
         p.liquidTexture=item.value("liquid_texture_strength",0.f);
+        p.nativeLiquidGlow=item.value("native_liquid_glow",false);
         p.liquidNativeUV=item.value("liquid_texture_native_uv",false);
         p.bulkLiquidTexture=item.value("liquid_texture_bulk_slosh",false);
         if(item.contains("liquid_texture_scroll_rate")){
@@ -226,12 +276,19 @@ void loadProfiles(const std::filesystem::path& path=root/"profiles.json",bool pr
         }
         p.liquidTextureTint=item.value("liquid_texture_tint",false);
         p.liquidTextureUnmirrored=item.value("liquid_texture_unmirrored",false);
+        if(item.contains("liquid_emission_color")){
+            auto rgb=item.at("liquid_emission_color").get<std::array<float,3>>();
+            for(float v:rgb)if(!std::isfinite(v)||v<0)throw std::runtime_error("Invalid liquid emission color");
+            p.emissionColor={rgb[0],rgb[1],rgb[2],1};
+        }
         p.liquidEmission=item.value("liquid_emission",0.f);
         p.liquidPointLightScattering=item.value("liquid_point_light_scattering",1.f);
-        p.glassRefractionScale=item.value("glass_refraction_scale",1.f);
+        p.liquidInteriorPointLightScattering=item.value("liquid_interior_point_light_scattering",p.liquidPointLightScattering);
+        p.glassRefractionScale=p.shieldWetParticles?0.f:item.value("glass_refraction_scale",1.f);
         if(!std::isfinite(p.glassRefractionScale)||p.glassRefractionScale<0||p.glassRefractionScale>8)throw std::runtime_error("Glass refraction scale must be in [0,8]");
         if(!std::isfinite(p.liquidEmission)||p.liquidEmission<0||p.liquidEmission>4)throw std::runtime_error("Liquid emission must be in [0,4]");
         if(!std::isfinite(p.liquidPointLightScattering)||p.liquidPointLightScattering<0||p.liquidPointLightScattering>1)throw std::runtime_error("Liquid point-light scattering must be in [0,1]");
+        if(!std::isfinite(p.liquidInteriorPointLightScattering)||p.liquidInteriorPointLightScattering<0||p.liquidInteriorPointLightScattering>1)throw std::runtime_error("Interior liquid point-light scattering must be in [0,1]");
         if(p.liquidNativeUV&&p.liquidTexture<=0)throw std::runtime_error("Native liquid animation requires textured liquid");
         if(!std::isfinite(p.liquidTexture)||p.liquidTexture<0||p.liquidTexture>1||(p.liquidTexture>0&&!p.colorlessGlass))throw std::runtime_error("Liquid texture requires colorless glass and strength in [0,1]");
         if(item.contains("liquid_texture_rect")){
@@ -239,16 +296,23 @@ void loadProfiles(const std::filesystem::path& path=root/"profiles.json",bool pr
             p.liquidTextureRect={r[0],r[1],r[2],r[3]};const auto& t=p.liquidTextureRect;
             if(!std::isfinite(t.x)||!std::isfinite(t.y)||!std::isfinite(t.z)||!std::isfinite(t.w)||t.x<0||t.y<0||t.z>1||t.w>1||t.z<=t.x||t.w<=t.y)throw std::runtime_error("Invalid liquid texture rectangle");
         }
-        const bool disableRefraction=item.value("disable_liquid_refraction",false);
-        p.disableLiquidRefraction=disableRefraction||liquidOpacity>.95f;
-        const bool opaqueLiquid=liquidOpacity==1.f;
-        p.directNativeLiquid=p.nativeGlassPrototype&&(opaqueLiquid||disableRefraction);
+        if(p.nativeLiquidGlow&&name.starts_with("DBL_SSE_Rustic_")&&item.contains("rustic_liquid_uv_bounds")){
+            const auto uv=item.at("rustic_liquid_uv_bounds").get<std::array<float,6>>();
+            if(!std::all_of(uv.begin(),uv.end(),[](float n){return std::isfinite(n);})||
+               uv[2]<=uv[0]||uv[3]<=uv[1]||uv[5]<=uv[4])throw std::runtime_error("Invalid RUSTIC liquid UV bounds");
+            p.liquidTextureRect={uv[0],uv[1],uv[2],uv[3]};
+            p.rusticMapping={uv[4],uv[5],1,0};
+        }
         p.nativeFrontGlassOpacity=item.value("native_front_glass_opacity",0.f);
         if(!std::isfinite(p.nativeFrontGlassOpacity)||p.nativeFrontGlassOpacity<0||p.nativeFrontGlassOpacity>1||
-            (p.nativeFrontGlassOpacity>0&&!p.directNativeLiquid))
-            throw std::runtime_error("Native front-glass opacity must be in [0,1] and requires direct native liquid");
-        // Preserve depth-based opacity for existing translucent profiles.
-        if(opaqueLiquid||p.directNativeLiquid)p.liquidAlphaOverride=liquidOpacity;
+           (p.nativeFrontGlassOpacity>0&&!p.nativeGlassPrototype))
+            throw std::runtime_error("Native front-glass opacity requires native glass and a value in [0,1]");
+        // These native families author fixed liquid coverage. Other translucent
+        // profiles retain the existing thickness-based absorption curve.
+        const bool fixedNativeCoverage=p.nativeGlassPrototype&&
+            (p.authoredGlass||p.shieldWetParticles||name.starts_with("DBL_SSE_HPP_"));
+        if(liquidOpacity==1.f||fixedNativeCoverage)
+            p.liquidAlphaOverride=liquidOpacity;
         s.shakingBubbles=item.value("agitation",1.f);s.foamStrength=s.shakingBubbles;
         if(item.contains("carbonation")){
             float rate=item.at("carbonation").get<float>();
@@ -284,6 +348,7 @@ void ApplyFillHeightOffset(float points){
     instances.clear();
 }
 #endif
+#include "VisualTuning.inc"
 void initialize(ID3D11Device* device,const std::filesystem::path& shaderPath=root/"Bottle.hlsl") {
     rippleTexture.Create(device);
     ComPtr<ID3DBlob> v,p,e;
@@ -314,9 +379,57 @@ void initialize(ID3D11Device* device,const std::filesystem::path& shaderPath=roo
     d.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;check(device->CreateDepthStencilState(&d,&liquidDepthWrite));
     D3D11_RASTERIZER_DESC r{}; r.FillMode=D3D11_FILL_SOLID; r.CullMode=D3D11_CULL_NONE; r.DepthClipEnable=true;
     check(device->CreateRasterizerState(&r,&raster));
+    ComPtr<ID3DBlob> shellCode;
+    check(D3DReadFileToBlob((shaderPath.parent_path()/"TmdShellOptics.cso").c_str(),&shellCode));
+    check(device->CreatePixelShader(shellCode->GetBufferPointer(),shellCode->GetBufferSize(),nullptr,&shellOpticsPS));
+    shellCode.Reset();
+    check(D3DReadFileToBlob((shaderPath.parent_path()/"TmdShellCoverage.cso").c_str(),&shellCode));
+    check(device->CreatePixelShader(shellCode->GetBufferPointer(),shellCode->GetBufferSize(),nullptr,&shellCoveragePS));
+    try{
+        bottleProjection.Initialize(device,shaderPath.parent_path());
+    }catch(const std::exception& e){
+        SKSE::log::warn("[DBL-bottle-projection] Preview unavailable: {}",e.what());
+    }
+    D3D11_BUFFER_DESC shellDesc{};shellDesc.ByteWidth=sizeof(TmdShellConstants);shellDesc.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+    check(device->CreateBuffer(&shellDesc,nullptr,&shellOpticsBuffer));
     opticalBuffers.initialize(device,shaderPath);
 }
-bool supportedTargets(ID3D11DeviceContext* ctx,D3D11_RENDER_TARGET_VIEW_DESC* primary=nullptr) {
+bool IsMainSceneTarget(ID3D11RenderTargetView* view){
+    auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
+    if(!renderer||!view)return false;
+    ComPtr<ID3D11Resource> resource;view->GetResource(&resource);
+    return resource&&resource.Get()==renderer->renderTargets[RE::RENDER_TARGET::kMAIN].texture;
+}
+bool IsHdrBottleWorldLayout(ID3D11RenderTargetView* const (&targets)[8]){
+    if(!targets[0]||!targets[1]||!targets[2]||
+       std::any_of(targets+3,targets+8,[](auto* target){return target!=nullptr;}))return false;
+    const auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
+    if(!renderer)return false;
+    constexpr RE::RENDER_TARGET slots[]={RE::RENDER_TARGET::kMAIN,RE::RENDER_TARGET::kTEMPORAL_AA_MASK,
+        RE::RENDER_TARGET::kMAIN_ONLY_ALPHA};
+    constexpr DXGI_FORMAT formats[]={DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16G16B16A16_FLOAT};
+    for(int i=0;i<3;++i){
+        D3D11_RENDER_TARGET_VIEW_DESC desc{};
+        targets[i]->GetDesc(&desc);
+        if(desc.Format!=formats[i]||desc.ViewDimension!=D3D11_RTV_DIMENSION_TEXTURE2D||desc.Texture2D.MipSlice)return false;
+        ComPtr<ID3D11Resource> resource;
+        targets[i]->GetResource(&resource);
+        if(resource.Get()!=renderer->renderTargets[slots[i]].texture)return false;
+    }
+    return true;
+}
+#include "BottleGlassDepth.inc"
+void DrawNativeBottleGlass(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
+    BottleGlassDepthRequest depthRequest(ctx);
+    if(profile&&profile->nativeGlassPrototype&&count==profile->indices&&
+       IsNativeGlassColorPass(ctx)&&UsesBottledWorldGlassDepth(ctx))
+        depthRequest.normalize();
+    oldDraw(ctx,count,start,base);
+}
+bool supportedTargets(ID3D11DeviceContext* ctx,D3D11_RENDER_TARGET_VIEW_DESC* primary=nullptr,
+                      ID3D11RenderTargetView** primaryView=nullptr,bool retainPrimaryForDeferred=false,
+                      bool* hdrWorldLayout=nullptr) {
     ID3D11RenderTargetView* targets[8]{}; ctx->OMGetRenderTargets(8,targets,nullptr);
     if(primary&&targets[0])targets[0]->GetDesc(primary);
     bool single=targets[0]!=nullptr; for(int i=1;i<8;i++)if(targets[i])single=false;
@@ -324,11 +437,69 @@ bool supportedTargets(ID3D11DeviceContext* ctx,D3D11_RENDER_TARGET_VIEW_DESC* pr
     const DXGI_FORMAT expected[]={DXGI_FORMAT_R11G11B10_FLOAT,DXGI_FORMAT_R8G8_UNORM,DXGI_FORMAT_R11G11B10_FLOAT};
     for(int i=0;i<8;i++){
         if(i>=3){if(targets[i])world=false;}
-        else if(targets[i]){D3D11_RENDER_TARGET_VIEW_DESC d{};targets[i]->GetDesc(&d);if(d.Format!=expected[i]||d.ViewDimension!=D3D11_RTV_DIMENSION_TEXTURE2D)world=false;}
+        else if(targets[i]){D3D11_RENDER_TARGET_VIEW_DESC d{};targets[i]->GetDesc(&d);const bool mainHdr=i==0&&d.Format==DXGI_FORMAT_R16G16B16A16_FLOAT&&IsMainSceneTarget(targets[0]);if((d.Format!=expected[i]&&!mainHdr)||d.ViewDimension!=D3D11_RTV_DIMENSION_TEXTURE2D)world=false;}
     }
+    const bool hdrWorld=!single&&!world&&hdrWorldLayout&&IsHdrBottleWorldLayout(targets);
+    if(hdrWorldLayout)*hdrWorldLayout=hdrWorld;
+    if(primaryView&&(single||world||retainPrimaryForDeferred||hdrWorld)){*primaryView=targets[0];targets[0]=nullptr;}
     for(auto* t:targets)if(t)t->Release();
     return single||world;
 }
+#ifdef DBL_DEVELOPMENT
+bool medievalTrace=false;
+bool jessicaTrace=false;
+void TraceMedieval(const RE::BSGeometry* geometry,std::string_view stage,ID3D11DeviceContext* ctx=nullptr,
+                   UINT count=0,UINT stride=0,bool geometryCB=false,bool cameraCB=false){
+    if(!medievalTrace||!geometry)return;
+    const std::string_view name=geometry->name.c_str();
+    if(!name.starts_with("DBL_SSE_MedievalSpirits_"))return;
+    static thread_local std::unordered_set<std::string> seen;
+    if(!seen.emplace(std::format("{}/{}",name,stage)).second)return;
+    if(!ctx){
+        SKSE::log::info("[DBL-medieval-trace] shape={} stage={}",name,stage);
+        return;
+    }
+    ComPtr<ID3D11RenderTargetView> color;
+    ComPtr<ID3D11DepthStencilView> depthView;
+    ctx->OMGetRenderTargets(1,&color,&depthView);
+    D3D11_RENDER_TARGET_VIEW_DESC colorDesc{};
+    D3D11_DEPTH_STENCIL_VIEW_DESC depthDesc{};
+    if(color)color->GetDesc(&colorDesc);
+    if(depthView)depthView->GetDesc(&depthDesc);
+    SKSE::log::info("[DBL-medieval-trace] shape={} stage={} indices={} stride={} geometry_cb={} camera_cb={} main={} color_format={} depth_format={}",
+        name,stage,count,stride,geometryCB,cameraCB,IsMainSceneTarget(color.Get()),unsigned(colorDesc.Format),unsigned(depthDesc.Format));
+}
+void TraceJessica(const RE::BSGeometry* geometry,std::string_view stage,ID3D11DeviceContext* ctx=nullptr,
+                  UINT count=0,UINT stride=0){
+    if(!jessicaTrace||!geometry||geometry->name!="DBL_SSE_TMDWinery_winebottle01jessica")return;
+    const bool held=GrabbedBottle(geometry);
+    if(!ctx){
+        static thread_local std::unordered_set<std::string_view> seen[2];
+        if(seen[held].emplace(stage).second)
+            SKSE::log::info("[DBL-jessica] frame={} stage={} held={}",frame,stage,held);
+        return;
+    }
+    ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<ID3D11DepthStencilView> depthView;
+    ComPtr<ID3D11BlendState> blendState;
+    ctx->OMGetRenderTargets(1,&target,&depthView);
+    ctx->OMGetBlendState(&blendState,nullptr,nullptr);
+    D3D11_RENDER_TARGET_VIEW_DESC targetDesc{};
+    D3D11_DEPTH_STENCIL_VIEW_DESC depthDesc{};
+    D3D11_BLEND_DESC blendDesc{};
+    if(target)target->GetDesc(&targetDesc);
+    if(depthView)depthView->GetDesc(&depthDesc);
+    if(blendState)blendState->GetDesc(&blendDesc);
+    const auto& color=blendDesc.RenderTarget[0];
+    const auto state=std::format("held={} main={} color={} depth={} blend={} src={} dst={} write={} indices={} stride={}",
+        held,IsMainSceneTarget(target.Get()),unsigned(targetDesc.Format),unsigned(depthDesc.Format),
+        bool(color.BlendEnable),unsigned(color.SrcBlend),unsigned(color.DestBlend),
+        unsigned(color.RenderTargetWriteMask),count,stride);
+    static thread_local std::unordered_set<std::string> seen;
+    if(seen.emplace(std::format("{}/{}",stage,state)).second)
+        SKSE::log::info("[DBL-jessica] frame={} stage={} {}",frame,stage,state);
+}
+#endif
 GPU BuildLiquidGPU(Instance& inst,const Profile* profile,Vec bottleUp,bool outsideSimulation,bool resuming,float detailWeight,float effectWeight,const std::array<float,20>& effectWeights){
     GPU gpu{}; const auto& c=inst.constants;LiquidPose pose;pose.Capture(c,inst.motion.time);
     float renderClock=inst.motion.time;
@@ -340,14 +511,19 @@ GPU BuildLiquidGPU(Instance& inst,const Profile* profile,Vec bottleUp,bool outsi
     }
     if(outsideSimulation||resuming){pose=inst.lastPose;renderClock=pose.clock;}
     else if(!inst.distant){pose.clock=renderClock;inst.lastPose=pose;inst.hasPose=true;}
-    if(effectWeight<1){auto d=effectWeights[5]<1?RestingPlane(inst,*profile,bottleUp):pose.plane;float a=1-effectWeights[5];pose.plane={std::lerp(pose.plane.x,d.x,a),std::lerp(pose.plane.y,d.y,a),std::lerp(pose.plane.z,d.z,a),std::lerp(pose.plane.w,d.w,a)};pose.wave.x*=effectWeights[6];pose.detail.x*=effectWeights[6];}
-    if(effectWeight==1){auto d=effectWeights[5]<1?RestingPlane(inst,*profile,bottleUp):pose.plane;float a=1-effectWeights[5];pose.plane={std::lerp(pose.plane.x,d.x,a),std::lerp(pose.plane.y,d.y,a),std::lerp(pose.plane.z,d.z,a),std::lerp(pose.plane.w,d.w,a)};pose.wave.x*=effectWeights[6];pose.detail.x*=effectWeights[6];}
+    if(effectWeight<=1){
+        const auto resting=effectWeights[5]<1?RestingPlane(inst,*profile,bottleUp):pose.plane;
+        const float weight=1-effectWeights[5];
+        pose.plane={std::lerp(pose.plane.x,resting.x,weight),std::lerp(pose.plane.y,resting.y,weight),
+                    std::lerp(pose.plane.z,resting.z,weight),std::lerp(pose.plane.w,resting.w,weight)};
+        pose.wave.x*=effectWeights[6];pose.detail.x*=effectWeights[6];
+    }
     pose.wave.w*=effectWeights[6];
     for(int k=0;k<20;++k)reinterpret_cast<float*>(gpu.effectWeights)[k]=effectWeights[k];
     gpu.eye.x=detailWeight;gpu.eye.y=effectWeight;gpu.eye.z=-12345;
     gpu.effectWeights[4].y=distanceTuning.baseGlass?effectWeights[17]:0.f;gpu.effectWeights[4].z=distanceTuning.fresnel?effectWeights[18]:0.f;gpu.effectWeights[4].w=distanceTuning.liquidTrace?effectWeights[19]:0.f;
     std::copy_n(pose.modes,3,gpu.tunedModes);gpu.tunedInfo=c.tunedInfo;gpu.tunedInfo.w=0;rippleGPU(gpu,renderClock,profile->settings.viscosity);
-    gpu.viscousSurface=c.viscousSurface;gpu.viscousSurface.z=0;gpu.viscousSurface.w=0;gpu.wetInfo=c.wetInfo;std::copy_n(c.wetFilm,64,gpu.wetFilm);
+    gpu.viscousSurface=c.viscousSurface;gpu.viscousSurface.z=0;gpu.wetInfo=c.wetInfo;std::copy_n(c.wetFilm,64,gpu.wetFilm);
     // Reserved wet-film channel: water=0, 30x viscosity and above=1.
     gpu.wetInfo.w=std::clamp(std::log2(std::max(profile->settings.viscosity,1.f))/std::log2(30.f),0.f,1.f);
     gpu.bubbleInfo.y=float(std::min({c.surfaceCount,int(inst.bubbleQuota.foam),64}));
@@ -360,12 +536,24 @@ GPU BuildLiquidGPU(Instance& inst,const Profile* profile,Vec bottleUp,bool outsi
     gpu.bubbleInfo.x+=float(carbonation);
     gpu.plane=pose.plane;gpu.wave=pose.wave;gpu.detail=pose.detail;gpu.color=profile->color;gpu.glass={.35f,.48f,.38f,0};
     gpu.liquidMaterial={profile->colorlessGlass?1.f:0.f,profile->liquidTexture,float(profile->designedHeight),float((profile->liquidNativeUV?1:0)|(profile->liquidTextureTint?2:0)|(profile->liquidTextureUnmirrored?4:0)|(profile->independentLiquidAnimation?8:0)|(profile->bulkLiquidTexture?16:0))};
+    gpu.traceSettings.x=float(dblui::TraceSampleCap());
+    gpu.emissionColor=profile->emissionColor;
     gpu.liquidEffects={profile->liquidEmission,profile->glassRefractionScale-1,float(profile->refractionMip),1-profile->liquidPointLightScattering};
-    if(profile->refractionMip>0&&!profile->directNativeLiquid)downsampleRequestedFrame=frame;
+    if(profile->refractionMip>0&&!profile->DirectNativeLiquid())downsampleRequestedFrame=frame;
     gpu.liquidTextureRect=profile->liquidTextureRect;
+    gpu.rusticMapping=profile->rusticMapping;
     if(profile->colorlessGlass)gpu.glass={.40f,.40f,.40f,0};
     const float glassOpacity=profile->liquidOnly?profile->nativeFrontGlassOpacity:profile->glassOpacity;
-    gpu.appearance={glassOpacity,profile->liquidOnly?1.f:0.f,profile->liquidAlphaOverride,profile->disableLiquidRefraction?1.f:0.f};
+    gpu.appearance={profile->shieldWetParticles?0.f:glassOpacity,profile->liquidOnly?1.f:0.f,profile->liquidAlphaOverride,profile->LiquidOpaque()?1.f:0.f};
+    const auto& v=profile->visual;
+    gpu.visualLight=v.light;gpu.visualSurface=v.surface;
+    if(v.samples)gpu.traceSettings.x=float(v.samples);
+    gpu.traceSettings.y=float(v.straight>=0?v.straight:profile->refractionMip);
+    gpu.traceSettings.z=float(v.bent?v.bent:(profile->refractionMip?profile->refractionMip+1:0));
+    gpu.traceSettings.w=0;
+    if((v.straight>0||v.bent)&&!profile->DirectNativeLiquid())downsampleRequestedFrame=frame;
+    gpu.viscousSurface.w=(1+gpu.viscousSurface.w)*v.meniscus-1;
+    gpu.effectWeights[1].x*=v.wet;gpu.effectWeights[1].w*=v.ripple;
     std::copy_n(c.cavityPlanes,16,gpu.cavityPlanes);std::copy_n(c.rings,16,gpu.rings); float radius=0; for(int i=0;i<c.ringCount;i++)radius=std::max(radius,c.rings[i].y);
     gpu.bounds={c.rings[0].x,c.rings[c.ringCount-1].x,radius,float(c.ringCount)};
     return gpu;
@@ -380,7 +568,131 @@ bool UseNativeEnvironment(RE::BSShaderMaterial::Feature feature,bool cubeBound) 
 #include "NativeGlassBinding.h"
 #include "NativeGlassOrder.h"
 #include "LiquidDrawDistance.h"
-RE::BSLightingShaderMaterialBase* NativeLiquidMaterial(RE::BSGeometry* glass){
+struct FittingSample {
+    ComPtr<ID3D11Buffer> lighting;
+    UINT first{},count{};
+    ComPtr<ID3D11Buffer> pose;UINT poseFirst{},poseCount{};
+    RE::NiTransform transform;
+    bool local{};
+    uint64_t seen=~0ull;
+};
+thread_local std::unordered_map<const RE::BSGeometry*,FittingSample> fittingSamples;
+thread_local RE::BSGeometry* fittingBottle=nullptr;
+thread_local RE::BSGeometry* fittingGeometry=nullptr;
+// Discover the fitting from the confirmed liquid owner. The opaque batch can
+// submit its draw without leaving that owner in the shader setup hook.
+struct ElSopaFitting {
+    RE::NiPointer<RE::BSGeometry> bottle,geometry;
+    UINT indices{};
+    uint64_t visible{};
+};
+thread_local std::unordered_multimap<ID3D11Buffer*,ElSopaFitting> elSopaFittings;
+thread_local std::unordered_set<UINT> fittingIndexCounts;
+thread_local const RE::BSGeometry* setupGeometry=nullptr;
+thread_local const RE::BSRenderPass* projectionReceiverPass=nullptr;
+void RegisterElSopaFitting(RE::BSGeometry* bottle){
+    const std::string_view tag=bottle->name.c_str();
+    if(!bottle->parent||(!tag.starts_with("DBL_SSE_ElSopa_")&&!tag.starts_with("DBL_SSE_Mega_ElSopa")))return;
+    for(const auto& child:bottle->parent->GetChildren()){
+        auto* tri=child?child->AsTriShape():nullptr;
+        if(!tri)continue;
+        const std::string_view name=tri->name.c_str();
+        if(name!="organic"&&name!="Organic")continue;
+        auto* mesh=tri->GetGeometryRuntimeData().rendererData;
+        if(!mesh||!mesh->indexBuffer||!mesh->vertexBuffer)continue;
+        auto* key=reinterpret_cast<ID3D11Buffer*>(mesh->indexBuffer);
+        auto [begin,end]=elSopaFittings.equal_range(key);
+        for(auto it=begin;it!=end;++it)if(it->second.bottle.get()==bottle&&it->second.geometry.get()==tri){it->second.visible=frame;return;}
+        const UINT n=3u*tri->GetTrishapeRuntimeData().triangleCount;
+        elSopaFittings.emplace(key,ElSopaFitting{RE::NiPointer<RE::BSGeometry>(bottle),RE::NiPointer<RE::BSGeometry>(tri),n,frame});
+        fittingIndexCounts.insert(n);
+        return;
+    }
+}
+void ObserveBottleFitting(RE::BSRenderPass* pass){
+    auto* g=pass->geometry;
+    if(!g->parent)return;
+    const char* raw=g->name.c_str();
+    if(*raw!='C'&&*raw!='P'&&*raw!='o'&&*raw!='O')return;
+    const std::string_view name(raw);
+    if(name!="Cork"&&name!="organic"&&name!="Organic"&&!(name.starts_with("Potion ")&&name.ends_with(" Cork")))return;
+    for(const auto& child:g->parent->GetChildren()){
+        auto* bottle=child?child->AsGeometry():nullptr;
+        if(!bottle)continue;
+        const std::string_view tag=bottle->name.c_str();
+        if(!tag.starts_with("DBL_SSE_Skyking_")&&!tag.starts_with("DBL_SSE_ElSopa_")&&!tag.starts_with("DBL_SSE_Mega_ElSopa"))continue;
+        const auto* target=FindBottleProfile(profiles,bottle->name.c_str());
+        if(target&&target->nativeGlassPrototype){fittingBottle=bottle;fittingGeometry=g;return;}
+    }
+}
+ComPtr<ID3D11ShaderResourceView> NativeSunShadow(ID3D11DeviceContext*,bool);
+void CaptureFitting(ID3D11DeviceContext* ctx,const RE::BSGeometry* bottle,RE::BSGeometry* geometry,bool verifyPose){
+    auto& sample=fittingSamples[bottle];
+    if(sample.seen==frame&&(!verifyPose||sample.pose))return;
+    if(verifyPose&&!NativeSunShadow(ctx,false))return;
+    auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
+    ComPtr<ID3D11ShaderResourceView> shadow;
+    ctx->PSGetShaderResources(14,1,&shadow);
+    if(!renderer||!shadow||shadow.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(renderer->renderTargets[RE::RENDER_TARGET::kSHADOW_MASK].SRV))return;
+    auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->properties[1].get());
+    if(!prop||!prop->material)return;
+    ComPtr<ID3D11DeviceContext1> cx;ctx->QueryInterface(IID_PPV_ARGS(&cx));
+    ComPtr<ID3D11Buffer> src;
+    UINT first=0,count=0;
+    if(cx)cx->PSGetConstantBuffers1(2,1,&src,&first,&count);
+    else ctx->PSGetConstantBuffers(2,1,&src);
+    if(!src)return;
+    D3D11_BUFFER_DESC desc{};src->GetDesc(&desc);
+    if(desc.ByteWidth<480||first>(desc.ByteWidth-480)/16||(cx&&count<30))return;
+    D3D11_BUFFER_DESC saved{};
+    if(sample.lighting)sample.lighting->GetDesc(&saved);
+    if(saved.ByteWidth!=desc.ByteWidth){
+        ComPtr<ID3D11Device> dev;ctx->GetDevice(&dev);
+        saved={};saved.ByteWidth=desc.ByteWidth;saved.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        if(FAILED(dev->CreateBuffer(&saved,nullptr,sample.lighting.ReleaseAndGetAddressOf())))return;
+    }
+    ctx->CopyResource(sample.lighting.Get(),src.Get());
+    if(verifyPose){
+        ComPtr<ID3D11Buffer> pose;
+        if(cx)cx->VSGetConstantBuffers1(2,1,&pose,&sample.poseFirst,&sample.poseCount);
+        else ctx->VSGetConstantBuffers(2,1,&pose);
+        if(!pose)return;
+        D3D11_BUFFER_DESC srcDesc{},dstDesc{};pose->GetDesc(&srcDesc);
+        if(srcDesc.ByteWidth<48||sample.poseFirst>(srcDesc.ByteWidth-48)/16||(cx&&sample.poseCount<3))return;
+        if(sample.pose)sample.pose->GetDesc(&dstDesc);
+        if(dstDesc.ByteWidth!=srcDesc.ByteWidth){
+            ComPtr<ID3D11Device> dev;ctx->GetDevice(&dev);
+            dstDesc={};dstDesc.ByteWidth=srcDesc.ByteWidth;dstDesc.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+            if(FAILED(dev->CreateBuffer(&dstDesc,nullptr,sample.pose.ReleaseAndGetAddressOf())))return;
+        }
+        ctx->CopyResource(sample.pose.Get(),pose.Get());
+    }else sample.pose.Reset();
+    sample.first=first;sample.count=count;sample.transform=geometry->world;
+    sample.local=prop->material->GetFeature()==RE::BSShaderMaterial::Feature::kDefault;
+    sample.seen=frame;
+}
+bool CaptureSubmittedFitting(ID3D11DeviceContext* ctx,UINT indices){
+    if(!fittingIndexCounts.contains(indices))return false;
+    ComPtr<ID3D11Buffer> index,vertex;DXGI_FORMAT format;UINT offset,stride;
+    ctx->IAGetIndexBuffer(&index,&format,&offset);
+    auto [begin,end]=elSopaFittings.equal_range(index.Get());
+    if(begin==end)return false;
+    ctx->IAGetVertexBuffers(0,1,&vertex,&stride,&offset);
+    ElSopaFitting* match=nullptr;bool ambiguous=false;
+    for(auto it=begin;it!=end;++it){
+        auto& reg=it->second;
+        if(frame-reg.visible>1||indices!=reg.indices)continue;
+        auto* mesh=reg.geometry->GetGeometryRuntimeData().rendererData;
+        if(!mesh||reinterpret_cast<ID3D11Buffer*>(mesh->vertexBuffer)!=vertex.Get())continue;
+        if(setupGeometry==reg.geometry.get()){match=&reg;ambiguous=false;break;}
+        if(match)ambiguous=true;
+        match=&reg;
+    }
+    if(!match||ambiguous)return false;
+    CaptureFitting(ctx,match->bottle.get(),match->geometry.get(),true);
+    return true;
+}
+RE::BSLightingShaderProperty* NativeLiquidProperty(RE::BSGeometry* glass){
     if(!glass->parent)return {};
     for(const auto& child:glass->parent->GetChildren()){
         if(!child)continue;
@@ -389,59 +701,386 @@ RE::BSLightingShaderMaterialBase* NativeLiquidMaterial(RE::BSGeometry* glass){
         auto* geometry=child->AsGeometry();if(!geometry)continue;
         auto* property=netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->GetGeometryRuntimeData().properties[1].get());
         if(!property||!property->material)continue;
-        auto* material=static_cast<RE::BSLightingShaderMaterialBase*>(property->material);
-        return material;
+        return property;
     }
     return nullptr;
 }
-ComPtr<ID3D11ShaderResourceView> NativeLiquidTexture(RE::BSGeometry* glass){
-    if(auto* material=NativeLiquidMaterial(glass);material&&material->diffuseTexture&&material->diffuseTexture->rendererTexture){
-        // CommonLib NG leaves BSGraphics::Texture incomplete. Its DX11 backing
-        // storage is the NiTexture::RendererData layout (SRV at offset 0x10).
-        auto* data=reinterpret_cast<RE::NiTexture::RendererData*>(material->diffuseTexture->rendererTexture);
-        return ComPtr<ID3D11ShaderResourceView>(reinterpret_cast<ID3D11ShaderResourceView*>(data->resourceView));
+ComPtr<ID3D11ShaderResourceView> NativeTextureView(RE::NiSourceTexture* texture){
+    if(!texture||!texture->rendererTexture)return {};
+    auto* data=reinterpret_cast<RE::NiTexture::RendererData*>(texture->rendererTexture);
+    return ComPtr<ID3D11ShaderResourceView>(reinterpret_cast<ID3D11ShaderResourceView*>(data->resourceView));
+}
+ComPtr<ID3D11ShaderResourceView> NativeSunShadow(ID3D11DeviceContext* ctx,bool fittingMask=false){
+    auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
+    if(!renderer)return {};
+    const auto& mask=renderer->renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+    const auto& main=renderer->renderTargets[RE::RENDER_TARGET::kMAIN];
+    if(!mask.texture||!mask.SRV||!main.texture)return {};
+
+    // The native lighting draw uses t14 for its screen-space mask. Verify
+    // its identity before borrowing it so other passes and wrappers can fall back.
+    ComPtr<ID3D11ShaderResourceView> bound;
+    ctx->PSGetShaderResources(14,1,&bound);
+    if(fittingMask)bound=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV);
+    else if(bound.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV))return {};
+    ComPtr<ID3D11RenderTargetView> output;
+    ctx->OMGetRenderTargets(1,&output,nullptr);
+    if(!output)return {};
+    ComPtr<ID3D11Resource> outputResource;
+    output->GetResource(&outputResource);
+    if(outputResource.Get()!=reinterpret_cast<ID3D11Texture2D*>(main.texture))return {};
+
+    D3D11_TEXTURE2D_DESC shadowDesc{},mainDesc{};
+    reinterpret_cast<ID3D11Texture2D*>(mask.texture)->GetDesc(&shadowDesc);
+    reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
+    if(shadowDesc.Width!=mainDesc.Width||shadowDesc.Height!=mainDesc.Height||shadowDesc.SampleDesc.Count!=1)return {};
+    return bound;
+}
+
+struct NearbyProjection {
+    RE::NiPointer<RE::BSGeometry> body;
+    float distance{};
+};
+std::array<NearbyProjection,BottleProjection::maxPerFrame> nearbyProjections;
+
+void SelectNearbyProjections(){
+    nearbyProjections={};
+
+    size_t size=0;
+    for(const auto& [body,instance]:instances){
+        if(instance.projectionSeen!=frame)continue;
+        const NearbyProjection entry{instance.owner,instance.projectionDistance};
+        auto slot=std::lower_bound(nearbyProjections.begin(),nearbyProjections.begin()+size,entry,
+            [](const NearbyProjection& a,const NearbyProjection& b){
+                if(a.distance!=b.distance)return a.distance<b.distance;
+                return std::less<const RE::BSGeometry*>{}(a.body.get(),b.body.get());
+            });
+        if(slot==nearbyProjections.end())continue;
+        size=std::min(size+1,nearbyProjections.size());
+        auto end=nearbyProjections.begin()+size;
+        std::move_backward(slot,end-1,end);
+        *slot=entry;
     }
-    return {};
+}
+
+bool ProjectionTargets(const RE::BSGeometry* body){
+    return std::any_of(nearbyProjections.begin(),nearbyProjections.end(),
+        [body](const NearbyProjection& entry){return entry.body.get()==body;});
+}
+
+bool UsesNativeOpaqueShadow(const RE::BSGeometry* body){
+    if(!body)return false;
+    const auto* ownerProfile=FindBottleProfile(profiles,body->name.c_str());
+    if(selectedVisual&&body==selectedGeometry.get())ownerProfile=&*selectedVisual;
+    return ownerProfile&&(!ownerProfile->liquidOnly||ownerProfile->authoredGlass||NativeOpaqueShadow::VerifiedFittingBody(*body))&&
+        ownerProfile->visual.surface.z>-1.f&&
+        ownerProfile->glassOpacity>=1.f;
+}
+
+const RE::BSLight* SingleProjectionPointLight(const RE::BSRenderPass& pass);
+
+#include "ProjectionLightChecks.inc"
+
+void DrawNativeOpaqueShadow(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
+    if(!utilityPass||!distanceTuning.renderer||!nearbyProjections.front().body)return;
+    const auto& fitting=*utilityPass->geometry;
+    if(!fitting.parent)return;
+    for(const auto& candidate:nearbyProjections){
+        const auto* body=candidate.body.get();
+        if(!body||body->parent!=fitting.parent)continue;
+        const auto* light=SingleProjectionPointLight(*utilityPass);
+        bottleProjection.ObserveAtlas(ctx,body,light,frame);
+        if(!start&&!base&&body!=&fitting&&UsesNativeOpaqueShadow(body))
+            nativeOpaqueShadow.Draw(ctx,*body,fitting,light,count,frame);
+    }
+}
+
+const RE::BSLight* SingleProjectionPointLight(const RE::BSRenderPass& pass){
+    if(!pass.sceneLights)return nullptr;
+    const RE::BSLight* point=nullptr;
+    for(unsigned i=0;i<pass.numLights;++i){
+        const auto* light=pass.sceneLights[i];
+        if(!light||!light->pointLight||!light->light)continue;
+        if(point)return nullptr;
+        point=light;
+    }
+    return point;
+}
+
+const RE::BSLight* ProjectionReceiverLight(const RE::BSRenderPass& pass){
+    // Binding an existing mask only requires membership in this receiver's light list.
+    // Bootstrap it on the same receivers when the fireplace is already identified.
+    const auto onPass=[&](const RE::BSLight* light){
+        return light&&std::find(pass.sceneLights,pass.sceneLights+pass.numLights,light)!=pass.sceneLights+pass.numLights;
+    };
+    if(const auto* recent=bottleProjection.RecentReceiverLight(frame);onPass(recent)&&recent->pointLight&&recent->light)return recent;
+    if(bottleProjection.HasReceiverLight(frame))return nullptr;
+    const RE::BSLight* casterLight=nullptr;
+    for(const auto* light:bottleProjection.ReceiverCasterLights(frame)){
+        if(!onPass(light)||!light->pointLight||!light->light)continue;
+        if(casterLight)return nullptr;
+        casterLight=light;
+    }
+    if(casterLight)return casterLight;
+    auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(pass.geometry->properties[1].get());
+    if(!prop||!prop->material||prop->material->GetFeature()!=RE::BSShaderMaterial::Feature::kDefault)return nullptr;
+    // A single native point light gives a verified position, range and mask channel.
+    const auto* point=SingleProjectionPointLight(pass);
+    if(!point)return nullptr;
+    return point;
+}
+
+struct ProjectionReceiverCandidates {
+    RE::NiPoint3 origin{};
+    float radiusSquared{};
+    std::array<const BottleProjection::Caster*,BottleProjection::maxPerFrame> casters{};
+    size_t count{};
+};
+
+ProjectionReceiverCandidates FindProjectionReceiverCandidates(const RE::BSLight& point){
+    ProjectionReceiverCandidates result;
+    const float radius=point.light->GetLightRuntimeData().radius.x;
+    if(!(radius>0))return result;
+    result.origin=point.light->world.translate;
+    result.radiusSquared=radius*radius;
+    for(const auto& caster:bottleProjection.Casters(frame)){
+        if((caster.light&&caster.light!=&point)||!caster.body||!ProjectionTargets(caster.body))continue;
+        if((result.origin-caster.body->world.translate).SqrLength()<result.radiusSquared)
+            result.casters[result.count++]=&caster;
+    }
+    return result;
+}
+
+void PrepareProjectionReceiver(ID3D11DeviceContext* ctx,const RE::BSRenderPass& pass,
+                               ID3D11ShaderResourceView* mask,const RE::BSLight* point,
+                               const ProjectionReceiverCandidates& candidates){
+    std::array<const BottleProjection::Caster*,BottleProjection::maxPerFrame> eligible{};
+    size_t count=0;
+    bool needsTileLight=false;
+    for(size_t i=0;i<candidates.count;++i){
+        const auto* caster=candidates.casters[i];
+        if(caster->light==point)needsTileLight=true;
+        if(!UsesNativeOpaqueShadow(caster->body)||!nativeOpaqueShadow.Covers(caster->body,point,frame))
+            eligible[count++]=caster;
+    }
+    if(!count&&!needsTileLight)return;
+    bottleProjection.CaptureReceiverLight(ctx,frame,point,candidates.origin,candidates.radiusSquared,pass.geometry->world.translate);
+    auto end=std::remove_if(eligible.begin(),eligible.begin()+count,
+        [&](const auto* caster){return !bottleProjection.ReceiverReaches(caster->body,frame);});
+    bottleProjection.BuildReceiverMask(ctx,frame,mask,{eligible.data(),size_t(end-eligible.begin())});
+}
+
+struct BottleReceiverMaskBinding {
+    ID3D11DeviceContext* context;
+    ComPtr<ID3D11ShaderResourceView> original;
+    BottleReceiverMaskBinding(ID3D11DeviceContext* ctx,const RE::BSRenderPass* pass):context(ctx){
+        if(!pass||!pass->sceneLights||!pass->numLights)return;
+        try{
+            const auto validateMask=[&](){
+#ifdef DBL_FRAMEWORK_UI
+                dblui::ReceiverTimer timing(dblui::ReceiverStage::MaskValidation);
+#endif
+                return NativeSunShadow(ctx,false);
+            };
+            const auto affectsDraw=[&](){
+#ifdef DBL_FRAMEWORK_UI
+                dblui::ReceiverTimer timing(dblui::ReceiverStage::LightMatching);
+#endif
+                const auto* light=bottleProjection.ReceiverLight(frame);
+                return light&&std::find(pass->sceneLights,pass->sceneLights+pass->numLights,light)!=
+                    pass->sceneLights+pass->numLights;
+            };
+            const RE::BSLight* point=nullptr;
+            std::optional<ProjectionReceiverCandidates> candidates;
+            auto* modified=bottleProjection.ModifiedMask(frame);
+            if(modified){
+                if(!affectsDraw())return;
+            }else{
+#ifdef DBL_FRAMEWORK_UI
+                dblui::ReceiverTimer timing(dblui::ReceiverStage::LightMatching);
+#endif
+                point=ProjectionReceiverLight(*pass);
+                if(!point)return;
+                candidates=FindProjectionReceiverCandidates(*point);
+                if(!candidates->count)return;
+            }
+            auto mask=validateMask();
+            if(!mask)return;
+            ComPtr<ID3D11BlendState> blend;
+            ctx->OMGetBlendState(&blend,nullptr,nullptr);
+            if(blend){
+                D3D11_BLEND_DESC desc{};
+                blend->GetDesc(&desc);
+                if(desc.RenderTarget[0].BlendEnable)return;
+            }
+            if(point){
+                PrepareProjectionReceiver(ctx,*pass,mask.Get(),point,*candidates);
+                modified=bottleProjection.ModifiedMask(frame);
+                if(!modified||!affectsDraw())return;
+            }
+            original=std::move(mask);
+            context->PSSetShaderResources(14,1,&modified);
+        }catch(const std::exception& e){
+            static bool reported=false;
+            if(!reported){
+                reported=true;
+                SKSE::log::warn("[DBL-bottle-projection] Native mask fallback: {}",e.what());
+            }
+        }
+    }
+    ~BottleReceiverMaskBinding(){
+        if(original){
+            auto* view=original.Get();
+            context->PSSetShaderResources(14,1,&view);
+        }
+    }
+};
+
+void PrepareBottleProjection(ID3D11DeviceContext* ctx,const RE::BSGeometry* g,const Profile& profile,
+                             const GPU& gpu,const NativeConstantSlice* reflection,bool reflectionShadowed,
+                             const RE::BSLight* point,SceneSnapshot* freshCapture){
+    if(!ProjectionTargets(g)||gpu.bounds.w<2)return;
+    // Use the full cavity profile for the shadow, including the shoulder and
+    // neck. Its wide section only determines where to focus the caustic.
+    const float radius=gpu.bounds.z;
+    if(radius<=0)return;
+    float low=gpu.bounds.y,high=gpu.bounds.x;
+    for(int i=0;i<int(gpu.bounds.w);++i){
+        if(gpu.rings[i].y<radius*.55f)continue;
+        low=std::min(low,gpu.rings[i].x);
+        high=std::max(high,gpu.rings[i].x);
+    }
+    const float outerRadius=radius/.95f;
+    const float wall=outerRadius-radius;
+    const float center=(gpu.bounds.x+gpu.bounds.y)*.5f;
+    const float halfHeight=(gpu.bounds.y-gpu.bounds.x)*.5f+wall;
+    const float glassOpacity=profile.visual.surface.z<=-1.f?0.f:std::clamp(profile.glassOpacity,0.f,1.f);
+    const float glassExtinction=-std::log(std::max(1-glassOpacity,.01f))/(.1f*outerRadius);
+    const bool liquidVisible=profile.visual.surface.y>-1.f&&profile.settings.fill>0;
+    const float liquidOpacity=gpu.appearance.z;
+    const float extinction=liquidVisible?(liquidOpacity>0||profile.visual.surface.w>.5f?
+        -std::log(std::max(1-liquidOpacity,.005f))/(2*radius):gpu.color.w*.45f):0.f;
+    const float peak=std::max({gpu.color.x,gpu.color.y,gpu.color.z,.01f});
+    auto spectralExtinction=[&](float channel){return extinction*(1+.75f*(1-std::clamp(channel/peak,0.f,1.f)));};
+    BottleProjection::Constants data{
+        gpu.plane,{outerRadius,outerRadius,halfHeight,center},
+        {spectralExtinction(gpu.color.x),spectralExtinction(gpu.color.y),spectralExtinction(gpu.color.z),0},
+        {glassExtinction,0.f,liquidVisible&&glassOpacity<1.f?.9f:0.f,8*outerRadius},
+        {},{(unsigned(gpu.eye.w)&8u)?1.f:0.f,0,0,0},
+        {gpu.bounds.w,wall,(low+high)*.5f,glassOpacity>=1.f?1.f:0.f},{}
+    };
+    std::copy_n(gpu.rings,16,data.rings);
+    // Projection rays are in mesh space. Convert both world-unit limits.
+    const float scale=std::abs(g->world.scale);
+    if(scale>0.f){
+        data.controls.w=std::min(data.controls.w,32.f/scale);
+        data.absorption.w=std::min(data.controls.w,8.f/scale);
+    }else data.controls.z=0;
+    if(extinction<=0&&glassOpacity<=0&&data.controls.z<=0)return;
+    bottleProjection.RememberCaster(g,frame,data,point);
+#ifdef DBL_DEVELOPMENT
+    TraceMedieval(g,"caster-registered");
+    TraceJessica(g,"caster-registered");
+#endif
+    static bool loggedCaster=false;
+    if(!loggedCaster){
+        loggedCaster=true;
+        SKSE::log::info("[DBL-shadow-caster] registered {} on main scene",g->name.c_str());
+    }
+    if(data.controls.z<=0)return;
+    const bool useReceiver=!reflection&&bottleProjection.ReceiverReaches(g,frame)&&
+        (!point||point==bottleProjection.ReceiverLight(frame));
+    const bool mayHaveLight=CausticMayHaveLight(active,WorldProjectionLights(),g->world,data.body,reflectionShadowed||useReceiver);
+    try{
+        const auto* renderer=mayHaveLight?RE::BSGraphics::Renderer::GetRendererData():nullptr;
+        const bool directLightMask=mayHaveLight&&(reflectionShadowed||bool(NativeSunShadow(ctx)));
+        // Nearby targets are fixed for the frame.
+        const bool multiple=bool(nearbyProjections[1].body);
+        bottleProjection.Prepare(ctx,renderer,g,frame,data,reflection,directLightMask,useReceiver,multiple,freshCapture,mayHaveLight);
+    }catch(const std::exception& e){
+        static bool reported=false;
+        if(!reported){
+            reported=true;
+            SKSE::log::warn("[DBL-bottle-projection] Projection skipped: {}",e.what());
+        }
+    }
 }
 // Skyrim VR draws bottles with DrawIndexedInstanced, one instance per eye. The
-// renderer submits through DrawFn, so during an instanced bottle draw every
+// renderer submits through oldDraw, so during an instanced bottle draw every
 // native submission, including DBL's own liquid draw, keeps the same instancing.
 using DrawInstancedFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT,UINT,INT,UINT);
 struct InstancedCall{DrawInstancedFn original;UINT instances,startInstance;};
 thread_local const InstancedCall* instancedCall=nullptr;
-void STDMETHODCALLTYPE InstancedShim(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
-    instancedCall->original(ctx,count,instancedCall->instances,start,base,instancedCall->startInstance);
-}
-DrawFn NativeDraw(){return instancedCall?&InstancedShim:oldDraw;}
 void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original);
 bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder) {
     if(!distanceTuning.renderer||!active||!profile)return false;
-    if(!vs||count!=profile->indices){return false;}
+    auto* g=active->geometry;
+    if(!vs||count!=profile->indices){
+#ifdef DBL_DEVELOPMENT
+        TraceMedieval(g,!vs?"missing-shader":"index-count-rejected",ctx,count);
+        TraceJessica(g,!vs?"missing-shader":"index-count-rejected",ctx,count);
+#endif
+        return false;
+    }
     dblui::BottleTimer detailTimer;
     ForwardBindings native;bool captured=distanceTuning.optical&&forwardDraws.enabled&&forwardDraws.optimized;
     ComPtr<ID3D11Buffer> vb,geometry,perFrame; UINT stride{},offset{};
     if(captured){native.read(ctx,forwardDraws.cachedContext.Get()==ctx?forwardDraws.extended.Get():nullptr,true);stride=native.stride;geometry=native.vsCB[1];perFrame=native.vsCB[2];}
     else {ctx->IAGetVertexBuffers(0,1,&vb,&stride,&offset);
         ctx->VSGetConstantBuffers(2,1,&geometry);ctx->VSGetConstantBuffers(12,1,&perFrame);}
-    if((stride!=32&&!(profile->nativeGlassPrototype&&stride==28))||!geometry||!perFrame){return false;}
-    D3D11_RENDER_TARGET_VIEW_DESC lodDesc{};
+    if((stride!=32&&!(profile->nativeGlassPrototype&&stride==28))||!geometry||!perFrame){
+#ifdef DBL_DEVELOPMENT
+        TraceMedieval(g,"vertex-input-rejected",ctx,count,stride,bool(geometry),bool(perFrame));
+        TraceJessica(g,"vertex-input-rejected",ctx,count,stride);
+#endif
+        return false;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC lodDesc{};ComPtr<ID3D11RenderTargetView> primaryView;
+    bool immediateTargets=true,reverseWorld=false;
     if(profile->nativeGlassPrototype){
-        if(!NativeGlassBinding::Eligible(ctx,lodDesc)){return false;}
-    }else if(!supportedTargets(ctx,&lodDesc)){return false;}
-    auto* g=active->geometry; const auto& t=g->world; if(t.scale<=.0001f){return false;}
+        if(!NativeGlassBinding::Eligible(ctx,lodDesc,profile->authoredGlass,primaryView.GetAddressOf())){
+#ifdef DBL_DEVELOPMENT
+            TraceJessica(g,"native-glass-rejected",ctx,count,stride);
+#endif
+            return false;
+        }
+#ifdef DBL_DEVELOPMENT
+        TraceJessica(g,"native-glass-admitted",ctx,count,stride);
+#endif
+    }else{
+        const bool medieval=std::string_view(g->name.c_str()).starts_with("DBL_SSE_MedievalSpirits_");
+        bool hdrWorldLayout=false;
+        immediateTargets=supportedTargets(ctx,&lodDesc,primaryView.GetAddressOf(),medieval,&hdrWorldLayout);
+        // Replay into MAIN only. Keep the TAA mask and alpha target outside DBL's draw.
+        reverseWorld=(medieval||hdrWorldLayout)&&primaryView&&UsesBottledWorldGlassDepth(ctx,!immediateTargets);
+    }
+    if(!immediateTargets&&!reverseWorld){
+#ifdef DBL_DEVELOPMENT
+        TraceMedieval(g,"color-targets-rejected",ctx,count,stride,true,true);
+#endif
+        return false;
+    }
+    const auto& t=g->world; if(t.scale<=.0001f)return false;
     
-    BeginBubbleFrame(ctx);
+    BeginBubbleFrame(ctx); SelectHeld(g); if(selectedVisual && g==selectedGeometry.get())profile=&*selectedVisual;
+    if(profile->shieldWetParticles&&profile->visual.nativeAlpha>=1.f&&profile->visual.surface.z==0){
+        return true;
+    }
     auto& inst=instances[g]; inst.owner.reset(g);
     if(profile->nativeGlassPrototype&&inst.nativeGlassFrame==frame)return false;
-    ComPtr<ID3D11ShaderResourceView> nativeLiquid;
-    if(profile->nativeGlassPrototype){
-        nativeLiquid=NativeLiquidTexture(g);
-        if(!nativeLiquid){return false;}
+    auto* liquidProperty=profile->nativeGlassPrototype?NativeLiquidProperty(g):nullptr;
+    auto* liquidMaterial=liquidProperty?static_cast<RE::BSLightingShaderMaterialBase*>(liquidProperty->material):nullptr;
+    ComPtr<ID3D11ShaderResourceView> nativeLiquid,nativeGlow;
+    // Authored bottle bodies can anchor plain-colored liquid without a donor mesh.
+    if(profile->nativeGlassPrototype&&(!profile->authoredGlass||profile->liquidTexture>0)){
+        if(liquidMaterial)nativeLiquid=NativeTextureView(liquidMaterial->diffuseTexture.get());
+        if(!nativeLiquid)return false;
     }
     double time=now(); Vec pos{t.translate.x,t.translate.y,t.translate.z};
     bool worldDistance=false;
     float detailWeight=1,effectWeight=1,lodDistance=0;std::array<float,20> effectWeights;effectWeights.fill(1);
-    if(lodDesc.Format==DXGI_FORMAT_R11G11B10_FLOAT){
+    const bool mainScene=IsMainSceneTarget(primaryView.Get());
+    if(mainScene){
         auto* camera=RE::PlayerCamera::GetSingleton();auto* ui=RE::UI::GetSingleton();
         if(camera&&camera->cameraRoot&&!(ui&&ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME))){
             worldDistance=true;
@@ -453,7 +1092,7 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         }
     }
     detailTimer.Switch(dblui::BottleStage::Pose);
-    bool preview=lodDesc.Format!=DXGI_FORMAT_R11G11B10_FLOAT;
+    bool preview=!worldDistance;
     float budgetRadius=std::max(g->worldBound.radius,profile->settings.base.rings[0].z*t.scale);
     float pixels=preview||lodDistance<=budgetRadius?1024:2*budgetRadius/std::max(lodDistance-budgetRadius,.001f)*bubblePixelScale;
     const auto& settings=profile->settings;
@@ -535,7 +1174,17 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         // The draw's default lighting technique supplies model-space constants.
         // A native liquid texture donor does not determine the active technique.
         if(mat->GetFeature()==MaterialFeature::kDefault)gpu.eye.w+=8.f;
-        if(profile->nativeGlassPrototype)if(auto* liquidMat=NativeLiquidMaterial(g))mat=liquidMat;
+        if(liquidMaterial)mat=liquidMaterial;
+        if(profile->nativeLiquidGlow && liquidMaterial && liquidProperty->emissiveColor){
+            const auto& color=*liquidProperty->emissiveColor;
+            gpu.emissionColor={color.red,color.green,color.blue,1};
+            gpu.liquidEffects.x=std::max(0.f,liquidProperty->emissiveMult);
+            if(mat->GetFeature()==MaterialFeature::kGlowMap){
+                auto* glow=static_cast<RE::BSLightingShaderMaterialGlowmap*>(mat);
+                nativeGlow=NativeTextureView(glow->glowTexture.get());
+                if(nativeGlow)gpu.emissionColor.w=2;
+            }
+        }
         materialFeature=mat->GetFeature();
         if(profile->liquidNativeUV)gpu.liquidAnimation={mat->texCoordOffset[0].x,mat->texCoordOffset[0].y,mat->texCoordScale[0].x,mat->texCoordScale[0].y};
         gpu.authoredSpec={mat->specularColor.red*mat->specularColorScale,mat->specularColor.green*mat->specularColorScale,mat->specularColor.blue*mat->specularColorScale,std::clamp(mat->specularPower,1.f,1024.f)};
@@ -569,10 +1218,26 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
         if(UseNativeEnvironment(materialFeature,d.ViewDimension==D3D11_SRV_DIMENSION_TEXTURECUBE)&&m.ByteWidth>=48)gpu.glass.w=2;
     }
     auto& sceneSnapshot=profile->nativeGlassPrototype?nativeGlassSnapshot: ::sceneSnapshot;
+    const auto capturesBefore=sceneSnapshot.captures;
+    RefractionCamera refractionCamera;
     bool lateDraw=false;
+    // The immediate shader cannot take the unfamiliar auxiliary layout.
+    // While HDR is unavailable, use the same isolated MAIN forward replay
+    // on this draw. Other bottles keep their existing fallback.
+    const bool replayNow=!immediateTargets&&reverseWorld&&opticalBuffers.boundaryMissing;
     detailTimer.Switch(dblui::BottleStage::Optical);
     { // GPU commands are timed at their submission sites, not around CPU setup.
-    try{lateDraw=!profile->nativeGlassPrototype&&distanceTuning.optical&&opticalBuffers.prepare(ctx,frame,gpu.refraction,gpu.viewport);}catch(const std::exception& e){opticalBuffers.failed=true;SKSE::log::error("Optical producer unavailable; immediate fallback: {}",e.what());}
+    try{lateDraw=!profile->nativeGlassPrototype&&distanceTuning.optical&&opticalBuffers.prepare(ctx,mainScene?primaryView.Get():nullptr,frame,gpu.refraction,gpu.viewport,reverseWorld,replayNow);}catch(const std::exception& e){opticalBuffers.failed=true;SKSE::log::error("Optical producer unavailable; immediate fallback: {}",e.what());}
+    if(!immediateTargets&&!lateDraw){
+#ifdef DBL_DEVELOPMENT
+        TraceMedieval(g,"deferred-targets-rejected",ctx,count,stride,true,true);
+#endif
+        return false;
+    }
+#ifdef DBL_DEVELOPMENT
+    TraceMedieval(g,replayNow?"auxiliary-targets-immediate-forward":lateDraw?(immediateTargets?"deferred-admitted":"auxiliary-targets-deferred"):
+        mainScene?"main-immediate":"offscreen-immediate",ctx,count,stride,true,true);
+#endif
     gpu.bubbleInfo.z=lateDraw?1.f:0.f;
     if constexpr(vrStereo)if(!lateDraw&&vrTraceBudget>0){
         // VR draws every bottle directly. Give it the screen-size trace budget
@@ -585,22 +1250,109 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     ApplyLiquidDrawDistance(gpu,effectWeights,lateDraw,(profile->nativeGlassPrototype||vrStereo)&&worldDistance);
     if(!distanceTuning.liquidTrace)gpu.bubbleInfo.x=gpu.bubbleInfo.y=0;
     if(lateDraw)sceneSnapshot.status=forwardDraws.enabled?"pre-HDR forward resolve; shared final scene snapshot":"separate optical buffers";
-    else if(profile->directNativeLiquid){
+    else if(profile->DirectNativeLiquid()){
         // Draw liquid on the native glass boundary, immediately before glass.
         // Empty pixels alpha-blend away. No captured glass/background is
         // sampled, so the native shell cannot be refracted or fogged twice.
         gpu.refraction={};
     }else try{
-        // VR: one shared snapshot per frame. A per-bottle copy of the double-wide
-        // stereo target is too costly; the shader clamps lookups to each eye's half.
-        if(profile->nativeGlassPrototype||vrStereo)sceneSnapshot.captureShared(ctx,frame,gpu.refraction,gpu.viewport);else sceneSnapshot.capture(ctx,gpu.refraction,gpu.viewport);}catch(const std::exception& e){gpu.refraction={};sceneSnapshot.status=e.what();}
+        if constexpr(vrStereo){
+            // VR: one shared snapshot per frame. A per-bottle copy of the double-wide
+            // stereo target is too costly; the shader clamps lookups to each eye's half.
+            // The refraction camera reads one view's constants, so VR doesn't use it.
+            sceneSnapshot.captureShared(ctx,frame,gpu.refraction,gpu.viewport);
+        }else
+        if(profile->nativeGlassPrototype){
+            if(profile->nativeGlassPrototype&&worldDistance)refractionCamera.read(ctx);
+            const bool refreshHeld=g->name=="DBL_SSE_TMDWinery_winebottle01jessica"||
+                (mainScene&&g->name=="DBL_SSE_XMead_Ashfire");
+            const bool refresh=refreshHeld&&GrabbedBottle(g);
+            const auto* camera=refractionCamera.camera.buffer?&refractionCamera:nullptr;
+            sceneSnapshot.captureShared(ctx,frame,gpu.refraction,gpu.viewport,refresh,camera);
+#ifdef DBL_DEVELOPMENT
+            TraceJessica(g,refresh?(gpu.refraction.x?"held-refraction-refreshed":"held-refraction-unavailable"):
+                (gpu.refraction.x?"refraction-captured":"refraction-unavailable"));
+#endif
+        }else if(reverseWorld){
+            refractionCamera.read(ctx);
+            const auto* camera=refractionCamera.camera.buffer?&refractionCamera:nullptr;
+            sceneSnapshot.capture(ctx,gpu.refraction,gpu.viewport,false,false,camera,true);
+        }else sceneSnapshot.capture(ctx,gpu.refraction,gpu.viewport);
+    }catch(const std::exception& e){gpu.refraction={};sceneSnapshot.status=e.what();}
     }
     if(profile->nativeGlassPrototype&&captured&&native.csStrict&&communityLighting.liveBindingsReady(ctx))gpu.eye.w=float(unsigned(gpu.eye.w)|4u);
+    const FittingSample* fitting=nullptr;
+    bool reflectionShadowed=false;
+    // VR: the screen shadow mask, borrowed fitting lights and bottle projection
+    // assume one view, so they stay off in the stereo build.
+    const NativeConstantSlice* reflectionLighting=!vrStereo&&profile->authoredGlass?
+        tmdReflections.Lighting(ctx,g,&reflectionShadowed):nullptr;
+    const NativeConstantSlice* borrowedLight=nullptr;
+    if(worldDistance&&effectWeights[13]>0){
+        auto* player=RE::PlayerCharacter::GetSingleton();
+        auto* cell=player?player->GetParentCell():nullptr;
+        if(cell&&cell->IsInteriorCell()){
+            gpu.liquidEffects.w=1-profile->liquidInteriorPointLightScattering;
+            if(!vrStereo&&profile->nativeGlassPrototype&&!(unsigned(gpu.eye.w)&4u)){
+                RegisterElSopaFitting(g);
+                const auto it=fittingSamples.find(g);
+                if(it!=fittingSamples.end()&&it->second.seen==frame){
+                    fitting=&it->second;
+                    const auto relative=t.Invert()*fitting->transform;
+                    for(int i=0;i<3;++i){
+                        const auto& row=relative.rotate.entry[i];
+                        gpu.fittingRows[i]={row[0]*relative.scale,row[1]*relative.scale,row[2]*relative.scale,relative.translate[i]};
+                    }
+                    gpu.fittingPosition.x=fitting->pose?1.f:0.f;
+                    if(fitting->pose&&dblui::Extensive()){
+                        static std::unordered_set<std::string> reported;
+                        if(reported.emplace(g->name.c_str()).second)
+                            SKSE::log::info("[DBL-fitting] Bound same-frame fitting lighting and pose for {}",g->name.c_str());
+                    }
+                    gpu.fittingColor.w=fitting->local?relative.scale:-1.f;
+                }
+            }
+            if(reflectionLighting&&!(unsigned(gpu.eye.w)&4u)){
+                borrowedLight=reflectionLighting;
+                // TMD's environment-map reflection uses camera-relative world
+                // positions. The existing donor path converts to body-local if needed.
+                gpu.fittingPosition.y=1;
+                gpu.fittingColor.w=-1;
+            }
+            if(!vrStereo&&!profile->authoredGlass&&(fitting||std::string_view(g->name.c_str()).starts_with("DBL_SSE_TMDWinery_"))){
+                native.sunShadow=NativeSunShadow(ctx,fitting!=nullptr);
+                if(native.sunShadow)gpu.eye.w=float(unsigned(gpu.eye.w)|32u);
+            }
+        }else if(cell&&!vrStereo){
+            native.sunShadow=NativeSunShadow(ctx);
+            if(native.sunShadow)gpu.eye.w=float(unsigned(gpu.eye.w)|16u);
+        }
+    }
+    if(!vrStereo&&worldDistance&&gpu.bounds.w>=2&&gpu.bounds.z>0){
+        inst.projectionSeen=frame;
+        inst.projectionDistance=lodDistance;
+        const auto* point=inst.projectionLightFrame==frame?inst.projectionLight:nullptr;
+        PrepareBottleProjection(ctx,g,*profile,gpu,reflectionLighting,reflectionShadowed,point,
+            gpu.refraction.x&&sceneSnapshot.captures!=capturesBefore?&sceneSnapshot:nullptr);
+    }
     detailTimer.Switch(dblui::BottleStage::Upload);
     if(lateDraw&&forwardDraws.enabled&&forwardDraws.optimized){
         // No temporary graphics-state substitution and no extra copy of our own
         // constant buffer. Capture native bindings before touching the pipeline.
-        forwardDraws.capture(ctx,count,start,base,&gpu,captured?&native:nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));++opticalBuffers.draws;return true;
+        forwardDraws.capture(ctx,count,start,base,&gpu,captured?&native:nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));++opticalBuffers.draws;
+        if(replayNow){
+            try{opticalBuffers.replayPreparedForward();}
+            catch(...){opticalBuffers.reset();throw;}
+            return true;
+        }
+        if(reverseWorld){
+            static bool reported=false;
+            if(!reported){
+                reported=true;
+                SKSE::log::info("[DBL-world] Reverse-Z forward draw queued for {}",g->name.c_str());
+            }
+        }
+        return true;
     }
     D3D11_MAPPED_SUBRESOURCE map{}; if(FAILED(ctx->Map(buffer.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&map)))return false;
     memcpy(map.pData,&gpu,sizeof(gpu));ctx->Unmap(buffer.Get(),0);
@@ -612,49 +1364,216 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     ctx->OMGetBlendState(&obl,factors,&mask);ctx->OMGetDepthStencilState(&od,&stencil);ctx->RSGetState(&ors);
     // Split direct liquid draws in two-sided native glass.
     // Submit the rear shell with its untouched engine bindings before liquid.
-    const bool writeLiquidDepth=profile->directNativeLiquid&&profile->liquidAlphaOverride==1.f&&profile->nativeLiquidDepth&&effectWeights[19]>0;
-    if(profile->directNativeLiquid&&!writeLiquidDepth&&effectWeights[19]>0)glassOrder.Begin(ctx,NativeDraw(),count,start,base);
+    // TMD's translucent shell leaves depth open for particles drawn after wine.
+    // Keep normal alpha blending, but occlude those draws at the solved wet entry.
+    const bool shieldWetParticles=profile->shieldWetParticles && profile->liquidAlphaOverride>0 && profile->visual.surface.y>-1;
+    const bool writeLiquidDepth=effectWeights[19]>0 &&
+        (shieldWetParticles || (profile->DirectNativeLiquid() && profile->nativeLiquidDepth));
+    if(profile->authoredGlass)
+        glassOrder.Begin(ctx,oldDraw,count,start,base,false);
+    else if(profile->nativeGlassPrototype&&profile->liquidAlphaOverride>0&&(!writeLiquidDepth||shieldWetParticles)&&effectWeights[19]>0)
+        glassOrder.Begin(ctx,DrawNativeBottleGlass,count,start,base);
     ComPtr<ID3D11ShaderResourceView> oldScene,oldSceneDepth,oldBlur;ComPtr<ID3D11SamplerState> oldSceneSampler;
     if(gpu.refraction.x&&!lateDraw){ctx->PSGetShaderResources(12,1,&oldBlur);ctx->PSGetShaderResources(14,1,&oldSceneDepth);ctx->PSGetShaderResources(15,1,&oldScene);ctx->PSGetSamplers(15,1,&oldSceneSampler);}
     if(gpu.refraction.x&&!lateDraw){auto* blur=sceneSnapshot.blur.view();ctx->PSSetShaderResources(12,1,&blur);auto* d=sceneSnapshot.depthView.Get();auto* s=sceneSnapshot.colorView.Get();auto* sampler=sceneSnapshot.sampler.Get();ctx->PSSetShaderResources(14,1,&d);ctx->PSSetShaderResources(15,1,&s);ctx->PSSetSamplers(15,1,&sampler);}
     detailTimer.Switch(dblui::BottleStage::Submit);
     ctx->VSSetShader(vs.Get(),nullptr,0);ctx->PSSetShader(writeLiquidDepth?nativeDepthPS.Get():ps.Get(),nullptr,0);ctx->IASetInputLayout(layout.Get());
     BottleConstantBinding bottleConstants(ctx,native.extended.Get(),buffer.Get());
-    ctx->OMSetBlendState(blend.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(writeLiquidDepth?liquidDepthWrite.Get():depth.Get(),0);ctx->RSSetState(raster.Get());
+    RefractionCameraBinding cameraBinding(ctx,gpu.refraction.x>=3?&refractionCamera:nullptr,false);
+    ctx->OMSetBlendState(blend.Get(),nullptr,~0u);
+    ctx->OMSetDepthStencilState(writeLiquidDepth?liquidDepthWrite.Get():depth.Get(),0);ctx->RSSetState(raster.Get());
     RippleTexture::Binding rippleBinding(ctx,rippleTexture);
     NativeGlassBinding nativeGlassBinding(ctx);
-    if(profile->nativeGlassPrototype)nativeGlassBinding.Bind(nativeLiquid.Get());
-    if(lateDraw)opticalBuffers.produce(ctx,NativeDraw(),count,start,base,nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));
-    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,g->name.c_str(),reinterpret_cast<uintptr_t>(g));NativeDraw()(ctx,count,start,base);}
+    if(profile->nativeGlassPrototype)nativeGlassBinding.Bind(nativeLiquid.Get(),nativeGlow.Get());
+    struct RestoreSunShadow {
+        ID3D11DeviceContext* context;
+        ComPtr<ID3D11ShaderResourceView> previous;
+        bool bound;
+        RestoreSunShadow(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* mask):context(ctx),bound(mask!=nullptr){
+            if(bound){
+                context->PSGetShaderResources(sunShadowSlot,1,&previous);
+                context->PSSetShaderResources(sunShadowSlot,1,&mask);
+            }
+        }
+        ~RestoreSunShadow(){
+            if(bound){auto* view=previous.Get();context->PSSetShaderResources(sunShadowSlot,1,&view);}
+        }
+    } restoreSunShadow(ctx,native.sunShadow.Get());
+    NativeConstantSlice oldFitting;
+    ComPtr<ID3D11Buffer> oldPose;UINT oldPoseFirst=0,oldPoseCount=0;
+    ComPtr<ID3D11DeviceContext1> fittingContext;
+    if(borrowedLight||fitting){
+        ctx->QueryInterface(IID_PPV_ARGS(&fittingContext));
+        oldFitting.Read(ctx,fittingContext.Get(),false,7);
+        if(borrowedLight)borrowedLight->Bind(ctx,fittingContext.Get(),false,7);
+        else NativeConstantSlice{fitting->lighting,fitting->first,fitting->count}.Bind(ctx,fittingContext.Get(),false,7);
+        if(!borrowedLight&&fitting->pose){
+            auto* pose=fitting->pose.Get();
+            if(fittingContext){
+                fittingContext->PSGetConstantBuffers1(8,1,&oldPose,&oldPoseFirst,&oldPoseCount);
+                fittingContext->PSSetConstantBuffers1(8,1,&pose,&fitting->poseFirst,&fitting->poseCount);
+            }else{ctx->PSGetConstantBuffers(8,1,&oldPose);ctx->PSSetConstantBuffers(8,1,&pose);}
+        }
+    }
+    if(lateDraw)opticalBuffers.produce(ctx,oldDraw,count,start,base,nullptr,g->name.c_str(),reinterpret_cast<uintptr_t>(g));
+    else {dblui::GPUCost timing(ctx,dblui::GPUStage::Draw);dblui::LabelDraw(timing.token,g->name.c_str(),reinterpret_cast<uintptr_t>(g));oldDraw(ctx,count,start,base);}
+#ifdef DBL_DEVELOPMENT
+    TraceJessica(g,"liquid-submitted",ctx,count,stride);
+#endif
+    if(borrowedLight||fitting){
+        if(!borrowedLight&&fitting->pose){
+            auto* pose=oldPose.Get();
+            if(fittingContext)fittingContext->PSSetConstantBuffers1(8,1,&pose,&oldPoseFirst,&oldPoseCount);
+            else ctx->PSSetConstantBuffers(8,1,&pose);
+        }
+        oldFitting.Bind(ctx,fittingContext.Get(),false,7);
+    }
     if(profile->nativeGlassPrototype)inst.nativeGlassFrame=frame;
     if(gpu.refraction.x&&!lateDraw){auto* blur=oldBlur.Get();ctx->PSSetShaderResources(12,1,&blur);auto* d=oldSceneDepth.Get();auto* s=oldScene.Get();auto* sampler=oldSceneSampler.Get();ctx->PSSetShaderResources(14,1,&d);ctx->PSSetShaderResources(15,1,&s);ctx->PSSetSamplers(15,1,&sampler);}
     ctx->VSSetShader(ov.Get(),nullptr,0);ctx->PSSetShader(op.Get(),nullptr,0);ctx->IASetInputLayout(ol.Get());
     ctx->OMSetBlendState(obl.Get(),factors,mask);ctx->OMSetDepthStencilState(od.Get(),stencil);ctx->RSSetState(ors.Get());
-    static uint64_t draws=0;if(++draws==1||draws==120)SKSE::log::info("Liquid rendered: {} frame={} plane=({},{},{},{})",g->name.c_str(),frame,gpu.plane.x,gpu.plane.y,gpu.plane.z,gpu.plane.w);
     return true;
 }
 #include "VRDiagnostics.inc"
 __declspec(noinline) bool TryRenderBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder){
-    try{return render(ctx,count,start,base,glassOrder);}catch(const std::exception& e){SKSE::log::error("Bottle render skipped: {}",e.what());return false;}
+    try{return render(ctx,count,start,base,glassOrder);}catch(const std::exception& e){
+        SKSE::log::error("Bottle render skipped: {}",e.what());
+        return false;
+    }
 }
+#include "TmdShellOptics.inc"
+#define DBL_SHELL_OPTICS
+#include "TmdShellDraw.inc"
+#undef DBL_SHELL_OPTICS
+void DrawAuthoredBottleGlass(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
+    const auto& visual=profile->visual;
+    if(visual.surface.z<=-1.f)return;
+    float weight=1;
+    if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->cameraRoot){
+        auto delta=camera->cameraRoot->world.translate-active->geometry->world.translate;
+        weight=distanceTuning.Weight(0,delta.Length());
+    }
+    if(profile->nativeLiquidGlow&&visual.nativeAlpha<0){
+        // RUSTIC glass uses the source shader's per-pixel alpha until the user overrides opacity.
+        DrawShellTransmission(ctx,count,start,base,weight*visual.shellRefraction,
+                              weight>0?std::max(0,visual.straight):0);
+        DrawNativeBottleGlass(ctx,count,start,base);
+        return;
+    }
+    if(!DrawTmdShell(ctx,count,start,base,true,profile->glassOpacity,
+                     weight*visual.shellRefraction,weight>0?std::max(0,visual.straight):0)){
+#ifdef DBL_DEVELOPMENT
+        TraceJessica(active->geometry,"native-shell-fallback",ctx,count);
+#endif
+        DrawNativeBottleGlass(ctx,count,start,base);
+        return;
+    }
+#ifdef DBL_DEVELOPMENT
+    TraceJessica(active->geometry,"authored-shell-submitted",ctx,count);
+#endif
+}
+bool QueueTmdReflection(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
+    auto* body=tmdReflectionBody;
+    if(!body||!distanceTuning.renderer)return false;
+    auto* bodyProfile=FindBottleProfile(profiles,body->name.c_str());
+    if(selectedVisual&&body==selectedGeometry.get())bodyProfile=&*selectedVisual;
+    if(!bodyProfile||!bodyProfile->authoredGlass)return false;
+    const bool visible=bodyProfile->visual.surface.z>-1.f;
+    auto instance=instances.find(body);
+    if(instance!=instances.end()&&instance->second.nativeGlassFrame==frame)return !visible;
+    auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
+    if(!renderer)return false;
+    auto* target=renderer->renderTargets[RE::RENDER_TARGET::kMAIN].texture;
+    auto* shadowMask=renderer->renderTargets[RE::RENDER_TARGET::kSHADOW_MASK].SRV;
+    const bool reverseDepth=IsNativeGlassColorPass(ctx)&&UsesBottledWorldGlassDepth(ctx);
+    BottleGlassDepthRequest depthRequest(ctx);
+    if(reverseDepth)depthRequest.normalize();
+    const bool captured=tmdReflections.Capture(ctx,body,target,oldDraw,count,start,base,
+                                  reinterpret_cast<ID3D11ShaderResourceView*>(shadowMask),visible,reverseDepth);
+#ifdef DBL_DEVELOPMENT
+    TraceJessica(body,captured?"reflection-queued":"reflection-pass-through",ctx,count);
+#endif
+    if(captured&&tmdReflectionPoint){
+        auto& bottle=instances[body];
+        bottle.projectionLight=tmdReflectionPoint;
+        bottle.projectionLightFrame=frame;
+    }
+    return captured||!visible;
+}
+// The bottle path shared by SE's DrawIndexed hook and Skyrim VR's instanced
+// stereo draw (DrawBottleInstanced).
 __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base){
     bool handled=false;NativeGlassOrder glassOrder;
     {
         // Keep every rejection timed, but avoid entering the large renderer
         // stack frame for unrelated engine draws. Native draw time stays out.
         dblui::CPUCost cpuCost(dblui::CPUStage::Bottles);
+        if(distanceTuning.renderer){
+            const bool registered=!elSopaFittings.empty()&&CaptureSubmittedFitting(ctx,count);
+            if(!registered&&fittingBottle)CaptureFitting(ctx,fittingBottle,fittingGeometry,false);
+        }
         if(distanceTuning.renderer&&active&&profile){
             handled=TryRenderBottle(ctx,count,start,base,glassOrder);
         }
     }
-    if(glassOrder.active)glassOrder.Finish(NativeDraw(),count,start,base);
-    else if(!handled||(profile&&profile->nativeGlassPrototype))NativeDraw()(ctx,count,start,base);
+    if constexpr(vrStereo){
+        // TMD's authored shell and the shell refraction pass use one-view
+        // screen-space shaders, so VR draws those bottles' native glass instead.
+        if(glassOrder.active)glassOrder.Finish(DrawNativeBottleGlass,count,start,base);
+        else if(!handled||(profile&&(profile->nativeGlassPrototype||profile->authoredGlass)))DrawNativeBottleGlass(ctx,count,start,base);
+        return;
+    }
+    if(handled&&profile&&profile->authoredGlass){
+        if(glassOrder.active)glassOrder.Finish(DrawAuthoredBottleGlass,count,start,base);
+        else DrawAuthoredBottleGlass(ctx,count,start,base);
+        ComPtr<ID3D11RenderTargetView> view;
+        ctx->OMGetRenderTargets(1,&view,nullptr);
+        ComPtr<ID3D11Resource> target;
+        if(view)view->GetResource(&target);
+        tmdReflections.DrawPending(ctx,target.Get(),active->geometry,profile->visual.surface.z>-1.f);
+        return;
+    }
+    if(handled&&profile&&profile->nativeGlassPrototype&&!profile->shieldWetParticles&&
+       (profile->visual.shellRefraction>0||profile->visual.straight>0)){
+        float weight=1;
+        if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->cameraRoot){
+            auto delta=camera->cameraRoot->world.translate-active->geometry->world.translate;
+            weight=distanceTuning.Weight(0,delta.Length());
+        }
+        if(glassOrder.active)ctx->RSSetState(glassOrder.front.Get());
+        DrawShellTransmission(ctx,count,start,base,weight*profile->visual.shellRefraction,weight>0?profile->visual.straight:0);
+    }
+    if(glassOrder.active)glassOrder.Finish(DrawNativeBottleGlass,count,start,base);
+    else if(!handled||(profile&&profile->nativeGlassPrototype)){
+        // Fitting capture verifies the engine's original mask. Substitute the
+        // projected mask only when the native receiver is about to draw.
+        BottleReceiverMaskBinding receiverMask(ctx,!active&&!tmdReflectionBody?projectionReceiverPass:nullptr);
+        DrawNativeBottleGlass(ctx,count,start,base);
+    }
 }
 __declspec(noinline) void STDMETHODCALLTYPE draw(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base) {
     if(vrDiagnostics.enabled){
+        // Skyrim VR: bottles arrive through DrawBottleInstanced; plain draws pass through.
         vrDiagnostics.Observe(ctx,VRDiagnostics::kDrawIndexed,count,1,_ReturnAddress());
-        oldDraw(ctx,count,start,base);return;
+        PassThroughDraw(ctx,count,start,base);return;
     }
+    if(tmdReflections.IsRecording()){
+        oldDraw(ctx,count,start,base);
+        return;
+    }
+    DrawNativeOpaqueShadow(ctx,count,start,base);
+    if(tmdReflectionBody){
+        try{
+            if(QueueTmdReflection(ctx,count,start,base))return;
+        }catch(const std::exception& e){
+            static bool reported=false;
+            if(!reported){
+                reported=true;
+                SKSE::log::warn("[DBL-TMD-reflection] Native draw fallback: {}",e.what());
+            }
+        }
+    }
+    if(shellCoverage>=0 && DrawTmdShell(ctx,count,start,base))return;
     DrawBottle(ctx,count,start,base);
 }
 void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original){
@@ -663,35 +1582,198 @@ void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT
     DrawBottle(ctx,count,start,base);
     instancedCall=previous;
 }
+void* IndexedDrawEntry(ID3D11DeviceContext* context){
+    return (*reinterpret_cast<void***>(context))[12];
+}
+
+// An entry added at runtime may forward to an entry we hooked at startup.
+// Only the outer hook runs DBL. Both entries keep their own original call.
+struct IndexedDrawScope {
+    DrawFn previous=indexedDrawOriginal;
+    explicit IndexedDrawScope(DrawFn original){indexedDrawOriginal=original;}
+    ~IndexedDrawScope(){indexedDrawOriginal=previous;}
+};
+
+template<size_t Index>
+void STDMETHODCALLTYPE DispatchIndexedDraw(ID3D11DeviceContext* context,UINT count,UINT first,INT base){
+    IndexedDrawScope scope(indexedDrawHooks[Index].original);
+    if(scope.previous){
+        indexedDrawOriginal(context,count,first,base);
+        return;
+    }
+    draw(context,count,first,base);
+}
+
+void STDMETHODCALLTYPE oldDraw(ID3D11DeviceContext* context,UINT count,UINT first,INT base){
+    if constexpr(vrStereo)if(instancedCall){
+        instancedCall->original(context,count,instancedCall->instances,first,base,instancedCall->startInstance);
+        return;
+    }
+    PassThroughDraw(context,count,first,base);
+}
+// The engine's own draw, without VR instancing: upstream's oldDraw.
+void STDMETHODCALLTYPE PassThroughDraw(ID3D11DeviceContext* context,UINT count,UINT first,INT base){
+    if(indexedDrawOriginal){
+        indexedDrawOriginal(context,count,first,base);
+        return;
+    }
+    // HDR replay runs outside the indexed draw hook.
+    IndexedDrawScope scope(indexedDrawHooks[0].original);
+    context->DrawIndexed(count,first,base);
+}
+
+MH_STATUS HookIndexedDraw(void* target){
+    constexpr DrawFn dispatchers[]={DispatchIndexedDraw<0>,DispatchIndexedDraw<1>,
+        DispatchIndexedDraw<2>,DispatchIndexedDraw<3>};
+    static_assert(std::size(dispatchers)==std::tuple_size_v<decltype(indexedDrawHooks)>);
+    if(!target)return MH_ERROR_NOT_EXECUTABLE;
+    for(size_t i=0;i<indexedDrawHooks.size();++i){
+        auto& hook=indexedDrawHooks[i];
+        if(hook.target==target)return MH_OK;
+        if(hook.target)continue;
+        if(auto status=MH_CreateHook(target,reinterpret_cast<void*>(dispatchers[i]),
+                reinterpret_cast<void**>(&hook.original));status!=MH_OK)return status;
+        if(auto status=MH_EnableHook(target);status!=MH_OK){
+            MH_RemoveHook(target);
+            hook={};
+            return status;
+        }
+        hook.target=target;
+        return MH_OK;
+    }
+    return MH_ERROR_MEMORY_ALLOC;
+}
+
+void RefreshIndexedDraw(ID3D11DeviceContext* context){
+    static void* observed=indexedDrawHooks[0].target;
+    if(!context)return;
+    auto* entry=IndexedDrawEntry(context);
+    if(entry==observed)return;
+    observed=entry;
+    auto status=HookIndexedDraw(entry);
+    if(status!=MH_OK)SKSE::log::warn("[DBL-draw-entry] DrawIndexed hook recovery failed: {}",MH_StatusToString(status));
+}
+
+#ifdef DBL_DEVELOPMENT
+#include "DevelopmentCamera.inc"
+#endif
 HRESULT STDMETHODCALLTYPE present(IDXGISwapChain* s,UINT interval,UINT flags) {
     auto* renderer=RE::BSGraphics::Renderer::GetRendererData();
     const bool game=renderer&&IsGamePresentation(s,reinterpret_cast<IDXGISwapChain*>(renderer->renderWindows[0].swapChain),flags);
     if(vrDiagnostics.enabled)vrDiagnostics.Present(game);
     if(!game)return oldPresent(s,interval,flags);
+#ifdef DBL_DEVELOPMENT
+    ScheduleDevelopmentCameraGuard(frame);
+#endif
     if(frame==1)SKSE::log::info("Present hook active");
     {dblui::CPUCost housekeeping(dblui::CPUStage::Housekeeping);
     if(opticalBuffers.finishFrame(frame)){
         SKSE::log::warn("[DBL-HDR-fallback] No matching HDR pass; using visible immediate rendering until a verified MAIN HDR boundary returns. Crowded-scene performance may be reduced. attempts={} declared_MAIN={} bound_mismatch={}",opticalBuffers.hdrAttempts,opticalBuffers.hdrVerified,opticalBuffers.hdrBoundMismatch);
     }
-    if((frame+1)%120==0){double t=now();std::erase_if(instances,[&](auto& v){return t-v.second.time>3;});}
+    if((frame+1)%120==0){std::erase_if(elSopaFittings,[&](const auto& p){return frame-p.second.visible>120;});std::erase_if(fittingSamples,[&](const auto& p){return p.second.seen==~0ull||frame-p.second.seen>120;});double t=now();std::erase_if(instances,[&](auto& v){return t-v.second.time>3;});}
     }
+    const auto native=nativeOpaqueShadow.GetStats(frame);
     auto* savedActive=active;active=nullptr;
     try{dblui::Present(s,unsigned(instances.size()));}catch(const std::exception& e){SKSE::log::error("Performance UI skipped: {}",e.what());}
     active=savedActive;
+    static std::string_view lastStatus;
+    const auto status=native.confirmed?std::string_view("Native opaque shadow confirmed"):bottleProjection.Status(frame);
+    if(status!=lastStatus){
+        lastStatus=status;
+        SKSE::log::info("[DBL-bottle-projection] mode=automatic native_confirmed={} mask_draws={} caustic_draws={} status='{}'",
+                        native.confirmed,bottleProjection.ShadowCount(frame),bottleProjection.CausticCount(frame),status);
+    }
+    sceneSnapshot.depthLoaned=nativeGlassSnapshot.depthLoaned=false;
+    SelectNearbyProjections();
+    tmdReflections.Reset();
+    RefreshIndexedDraw(reinterpret_cast<ID3D11DeviceContext*>(renderer->context));
     ++frame;
     return oldPresent(s,interval,flags);
 }
 void setup(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags) {
-    active=nullptr;profile=nullptr;oldSetup(shader,pass,flags);
+    projectionReceiverPass=nullptr;
+    tmdReflectionPoint=nullptr;
+    shellCoverage=-1;setupGeometry=nullptr;fittingBottle=nullptr;fittingGeometry=nullptr;active=nullptr;profile=nullptr;tmdReflectionBody=nullptr;
+    // Only touch the tagged native glass or the TMD shell paired with its tagged sibling.
+    RE::BSLightingShaderMaterialBase* tunedMaterial=nullptr;
+    float savedAlpha=0,savedPower=0,savedSpec=0;
+    if(pass&&pass->geometry&&(selectedVisual||!visualOriginal.empty()||pass->geometry->name=="Bottle"||pass->geometry->name=="Bottle01")){
+        auto* g=pass->geometry;auto* owner=g;
+        auto* tuned=FindBottleProfile(profiles,g->name.c_str());
+        if(!tuned&&g->parent&&(g->name=="Bottle"||g->name=="Bottle01")){
+            for(const auto& child:g->parent->GetChildren()){
+                auto* sibling=child?child->AsGeometry():nullptr;if(!sibling)continue;
+                auto* candidate=FindBottleProfile(profiles,sibling->name.c_str());
+                if(candidate&&candidate->shieldWetParticles){tuned=candidate;owner=sibling;break;}
+            }
+        }
+        if(selectedVisual&&owner==selectedGeometry.get())tuned=&*selectedVisual;
+        if(tuned&&tuned->shieldWetParticles&&owner!=g){
+            auto* prop=netimmerse_cast<RE::BSLightingShaderProperty*>(g->properties[1].get());
+            if(prop&&prop->material){
+                tunedMaterial=static_cast<RE::BSLightingShaderMaterialBase*>(prop->material);auto& mat=*tunedMaterial;
+                savedAlpha=mat.materialAlpha;savedPower=mat.refractionPower;savedSpec=mat.specularColorScale;
+                const auto& v=tuned->visual;
+                if(tuned->shieldWetParticles&&owner!=g){
+                    shellCoverage=(v.nativeAlpha>=0?v.nativeAlpha:.85f)*(1+v.surface.z);
+                    shellBend=v.shellRefraction;shellMip=std::max(0,v.straight);
+                    if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->cameraRoot){
+                        auto delta=camera->cameraRoot->world.translate-g->world.translate;
+                        auto weight=distanceTuning.Weight(0,delta.Length());shellBend*=weight;if(weight<=0)shellMip=0;
+                    }
+                }
+                mat.materialAlpha=tuned->shieldWetParticles?1.f:(v.nativeAlpha>=0?v.nativeAlpha:savedAlpha)*(1+v.surface.z);
+
+                if(v.highlight>=0)mat.specularColorScale*=v.highlight;
+            }
+        }
+    }
+    oldSetup(shader,pass,flags);
+    if(tunedMaterial){tunedMaterial->materialAlpha=savedAlpha;tunedMaterial->refractionPower=savedPower;tunedMaterial->specularColorScale=savedSpec;}
     dblui::CPUCost hooks(dblui::CPUStage::Hooks);
     if(!pass||!pass->geometry)return;
+    setupGeometry=pass->geometry;
+    if(!bottleProjection.Casters(frame).empty()&&pass->numLights&&pass->sceneLights&&
+       !SkipProjectionForNoShadow(*pass,WorldProjectionLights()))projectionReceiverPass=pass;
+    if(pass->geometry->name=="Reflection"&&pass->geometry->parent){
+        for(const auto& child:pass->geometry->parent->GetChildren()){
+            auto* sibling=child?child->AsGeometry():nullptr;
+            if(!sibling)continue;
+            auto* candidate=FindBottleProfile(profiles,sibling->name.c_str());
+            if(candidate&&candidate->authoredGlass){
+                tmdReflectionBody=sibling;
+                tmdReflectionPoint=SingleProjectionPointLight(*pass);
+                break;
+            }
+        }
+    }
     profile=FindBottleProfile(profiles,pass->geometry->name.c_str());
+#ifdef DBL_DEVELOPMENT
+    TraceMedieval(pass->geometry,profile?"lighting-setup":"profile-missing");
+    TraceJessica(pass->geometry,profile?"lighting-setup":"profile-missing");
+#endif
+    if(selectedVisual && pass->geometry==selectedGeometry.get())profile=&*selectedVisual;
     if(profile){active=pass;if(vrDiagnostics.enabled)vrDiagnostics.Setup(pass);}
+    else ObserveBottleFitting(pass);
+
 
 }
 void restore(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags) {
     if(vrDiagnostics.enabled&&active)vrDiagnostics.Restore(active);
-    active=nullptr;profile=nullptr;oldRestore(shader,pass,flags);
+    projectionReceiverPass=nullptr;
+    tmdReflectionPoint=nullptr;
+    shellCoverage=-1;setupGeometry=nullptr;fittingBottle=nullptr;fittingGeometry=nullptr;active=nullptr;profile=nullptr;tmdReflectionBody=nullptr;oldRestore(shader,pass,flags);
+}
+void setupUtility(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags){
+    utilityPass=pass&&pass->geometry?pass:nullptr;
+#ifdef DBL_DEVELOPMENT
+    if(utilityPass)TraceMedieval(utilityPass->geometry,"utility-setup");
+#endif
+    oldUtilitySetup(shader,pass,flags);
+}
+void restoreUtility(RE::BSShader* shader,RE::BSRenderPass* pass,uint32_t flags){
+    utilityPass=nullptr;
+    oldUtilityRestore(shader,pass,flags);
 }
 void install() {
     auto* data=RE::BSGraphics::Renderer::GetRendererData();
@@ -699,25 +1781,41 @@ void install() {
     initialize(reinterpret_cast<ID3D11Device*>(data->forwarder));
     forwardDraws.enabled=true;
     auto status=MH_Initialize();if(status!=MH_OK&&status!=MH_ERROR_ALREADY_INITIALIZED)throw std::runtime_error("MinHook initialization failed");
-    auto** vtable=*reinterpret_cast<void***>(data->context);
     auto** swap=*reinterpret_cast<void***>(data->renderWindows[0].swapChain);
-    void* drawTarget=vtable[12]; void* presentTarget=swap[8]; // D3D may replace vtable entries after first use.
-    if(MH_CreateHook(drawTarget,reinterpret_cast<void*>(&draw),reinterpret_cast<void**>(&oldDraw))!=MH_OK)throw std::runtime_error("Draw hook failed");
-    if(MH_CreateHook(presentTarget,reinterpret_cast<void*>(&present),reinterpret_cast<void**>(&oldPresent))!=MH_OK){MH_RemoveHook(drawTarget);throw std::runtime_error("Present hook failed");}
-    auto drawStatus=MH_EnableHook(drawTarget);
+    void* drawTarget=IndexedDrawEntry(reinterpret_cast<ID3D11DeviceContext*>(data->context));
+    void* presentTarget=swap[8];
+    SKSE::log::info("[DBL-receiver] receiverSearch=on");
+#ifdef DBL_DEVELOPMENT
+    bottledGlassDepthTrial=std::filesystem::exists(root/"BottledGlassDepth.enable");
+    if(bottledGlassDepthTrial)SKSE::log::info("[DBL-glass-depth] Explicit MAIN depth override enabled");
+    medievalTrace=std::filesystem::exists(root/"MedievalTrace.enable");
+    if(medievalTrace)SKSE::log::info("[DBL-medieval-trace] enabled");
+    jessicaTrace=std::filesystem::exists(root/"JessicaTrace.enable");
+    if(jessicaTrace)SKSE::log::info("[DBL-jessica] enabled");
+#endif
+    if(MH_CreateHook(presentTarget,reinterpret_cast<void*>(&present),reinterpret_cast<void**>(&oldPresent))!=MH_OK)
+        throw std::runtime_error("Present hook failed");
+    auto drawStatus=HookIndexedDraw(drawTarget);
     auto presentStatus=drawStatus==MH_OK?MH_EnableHook(presentTarget):MH_UNKNOWN;
     SKSE::log::info("Hook activation: DrawIndexed={} Present={}",MH_StatusToString(drawStatus),MH_StatusToString(presentStatus));
-    if(drawStatus!=MH_OK||presentStatus!=MH_OK){MH_DisableHook(drawTarget);MH_DisableHook(presentTarget);throw std::runtime_error("Hook activation failed; see individual statuses above");}
+    if(drawStatus!=MH_OK||presentStatus!=MH_OK){
+        if(drawStatus==MH_OK)MH_RemoveHook(drawTarget);
+        MH_RemoveHook(presentTarget);
+        throw std::runtime_error("Hook activation failed; see individual statuses above");
+    }
     if constexpr(vrStereo){
         // Immediate path only: the late optical composition assumes one view and
         // is not ported to stereo yet.
         forwardDraws.enabled=false;distanceTuning.optical=false;
         SKSE::log::info("[DBL-VR] Skyrim VR stereo rendering: immediate path with shared-snapshot refraction; late composition off");
-        vrDiagnostics.Install(reinterpret_cast<ID3D11Device*>(data->forwarder),vtable);
+        vrDiagnostics.Install(reinterpret_cast<ID3D11Device*>(data->forwarder),*reinterpret_cast<void***>(data->context));
         vrDiagnostics.enabled=true;
     }
     REL::Relocation<uintptr_t> vt{RE::VTABLE_BSLightingShader[0]};
     oldSetup=reinterpret_cast<GeometryFn>(vt.write_vfunc(6,&setup));oldRestore=reinterpret_cast<GeometryFn>(vt.write_vfunc(7,&restore));
+    REL::Relocation<uintptr_t> utility{RE::VTABLE_BSUtilityShader[0]};
+    oldUtilitySetup=reinterpret_cast<GeometryFn>(utility.write_vfunc(6,&setupUtility));
+    oldUtilityRestore=reinterpret_cast<GeometryFn>(utility.write_vfunc(7,&restoreUtility));
     installHDRProbe();
     SKSE::log::info("Bottle hooks ready. {} loaded shape/appearance profiles.",profiles.size());
 }
@@ -753,10 +1851,10 @@ void ValidateBottleCoverage(){
 }
 }
 #ifdef DBL_SKYRIM_VR
-// VR fork: upstream release (1.0.0) plus the VR build number.
-constexpr REL::Version releaseVersion{1,0,0,1};
+// VR fork: upstream release (1.1.0) plus the VR build number.
+constexpr REL::Version releaseVersion{1,1,0,0};
 #else
-constexpr REL::Version releaseVersion{1,0,0,0};
+constexpr REL::Version releaseVersion{1,1,0,0};
 #endif
 #ifdef DBL_SKYRIM_VR
 // SKSE VR calls SKSEPlugin_Query and reports 1.4.15.1, so match the runtime family.
@@ -816,7 +1914,8 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 #ifdef DBL_SKYRIM_VR
     spdlog::info("Dynamic Bottle Liquids SE VR {} | Skyrim {}",releaseVersion.string("."),runtime.string());
 #else
-    spdlog::info("Dynamic Bottle Liquids SE 1.0.0 | Skyrim {}",runtime.string());
+    spdlog::info("Dynamic Bottle Liquids SE {}.{}.{} | Skyrim {}",
+        releaseVersion.major(),releaseVersion.minor(),releaseVersion.patch(),runtime.string());
 #endif
     #ifdef DBL_FRAMEWORK_UI
     // Collection starts only after the framework draws a DBL view.
@@ -828,13 +1927,29 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 #ifdef DBL_VR_TIMING
     dblui::EnableLogTiming(10);
 #endif
-    try{ApplyAcceptedSettings(distanceTuning);sharedBlurEnabled=true;loadProfiles();}catch(const std::exception& e){SKSE::log::error("Profile load failed: {}",e.what());return false;}
+    try{ApplyAcceptedSettings(distanceTuning);sharedBlurEnabled=true;loadProfiles();LoadSavedVisual();}catch(const std::exception& e){SKSE::log::error("Profile load failed: {}",e.what());return false;}
     if(!SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* m){
+#ifdef DBL_DEVELOPMENT
+        if(m->type==SKSE::MessagingInterface::kDataLoaded){
+            auto* setting=RE::GetINISetting("bDisableAutoVanityMode:Camera");
+            if(setting&&setting->GetType()==RE::Setting::Type::kBool){
+                setting->data.b=true;
+                SKSE::log::info("[DBL-development-camera] Automatic idle camera setting enabled");
+            }else SKSE::log::warn("[DBL-development] Automatic idle camera setting unavailable");
+            auto* delay=RE::GetINISetting("fAutoVanityModeDelay:Camera");
+            if(delay&&delay->GetType()==RE::Setting::Type::kFloat)delay->data.f=24*60*60.f;
+        }
+#endif
         #ifdef DBL_FRAMEWORK_UI
-        if(m->type==SKSE::MessagingInterface::kDataLoaded)dblui::RegisterFramework();
+        if(m->type==SKSE::MessagingInterface::kDataLoaded){dblui::RegisterFramework();RegisterVisualMenu();}
 #endif
         if(m->type==SKSE::MessagingInterface::kDataLoaded){try{install();ValidateBottleCoverage();}catch(const std::exception& e){SKSE::log::error("Bottle initialization failed: {}",e.what());}}
-        if(m->type==SKSE::MessagingInterface::kPreLoadGame||m->type==SKSE::MessagingInterface::kNewGame){instances.clear();bubbleBudgetFrame=~0ull;grabbedBottleRoot.reset();active=nullptr;profile=nullptr;opticalBuffers.reset();}
+        if(m->type==SKSE::MessagingInterface::kPreLoadGame||m->type==SKSE::MessagingInterface::kNewGame){
+            selectedGeometry.reset();selectedVisual.reset();selectedName.clear();instances.clear();
+            nearbyProjections={};bottleProjection.Reset();
+            projectionLightFrame={};
+            bubbleBudgetFrame=~0ull;grabbedBottleRoot.reset();active=nullptr;profile=nullptr;opticalBuffers.reset();
+        }
     })){
         SKSE::log::error("Could not register the SKSE message listener");
         return false;

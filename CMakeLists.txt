@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(DynamicBottleLiquidsSE VERSION 1.0.0 LANGUAGES CXX)
+project(DynamicBottleLiquidsSE VERSION 1.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 include(FetchContent)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)

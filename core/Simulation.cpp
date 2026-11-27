@@ -58,7 +58,7 @@ static V4 MeniscusGeometry(const Constants& c,Vec p){
     return {wall,r,0,0};
 }
 static float MeniscusFromGeometry(const Constants& c,V4 g){
-    float width=.35f+std::min(.35f*c.viscousSurface.y,g.y*.15f),height=.06f+std::min(.06f*c.viscousSurface.x,g.y*.03f);
+    float width=(.35f+std::min(.35f*c.viscousSurface.y,g.y*.15f))*(1+c.viscousSurface.w),height=.06f+std::min(.06f*c.viscousSurface.x,g.y*.03f);
     float t=std::clamp(1.f-g.x/width,0.f,1.f);
     return height*t*t*t;
 }
@@ -110,7 +110,7 @@ float MeniscusHeight(const Constants& c,Vec p){
     float wall=std::min(Radius(c,std::clamp(p.z,bottom,top))-CrossSection(c,p.x,p.y),std::min(p.z-bottom,top-p.z));
     // Match LiquidCore.inc; cached samples retain volume conservation.
     float r=Radius(c,std::clamp(p.z,bottom,top));
-    float width=.35f+std::min(.35f*c.viscousSurface.y,r*.15f),height=.06f+std::min(.06f*c.viscousSurface.x,r*.03f);
+    float width=(.35f+std::min(.35f*c.viscousSurface.y,r*.15f))*(1+c.viscousSurface.w),height=.06f+std::min(.06f*c.viscousSurface.x,r*.03f);
     float t=std::clamp(1.f-wall/width,0.f,1.f);
     return height*t*t*t;
 }
@@ -119,7 +119,7 @@ static float MeniscusHeightHinted(const Constants& c,Vec p,int& hint){
     float wall=std::min(RadiusHinted(c,std::clamp(p.z,bottom,top),hint)-CrossSection(c,p.x,p.y),std::min(p.z-bottom,top-p.z));
     // Match LiquidCore.inc; cached samples retain volume conservation.
     float r=RadiusHinted(c,std::clamp(p.z,bottom,top),hint);
-    float width=.35f+std::min(.35f*c.viscousSurface.y,r*.15f),height=.06f+std::min(.06f*c.viscousSurface.x,r*.03f);
+    float width=(.35f+std::min(.35f*c.viscousSurface.y,r*.15f))*(1+c.viscousSurface.w),height=.06f+std::min(.06f*c.viscousSurface.x,r*.03f);
     float t=std::clamp(1.f-wall/width,0.f,1.f);
     return height*t*t*t;
 }
@@ -274,7 +274,7 @@ Constants Simulate(const Settings& s,Motion& m,Vec acceleration,Vec up,float dt,
             m.rimHeight+=(wanted-m.rimHeight)*(-std::expm1(-dt/(.08f*visc.rimTime)));
         }
         surfaceUp=m.liquidUp;
-        c.viscousSurface={m.rimHeight,visc.width-1,0,0};
+        c.viscousSurface={m.rimHeight,visc.width-1,0,s.base.viscousSurface.w};
         // Thick deposits drain more slowly than the old thin wet sheen.
         float coating=std::clamp(std::log2(std::max(s.viscosity,1.f))/std::log2(30.f),0.f,1.f);
         c.wetTuning.w*=visc.film*(1+2*coating);

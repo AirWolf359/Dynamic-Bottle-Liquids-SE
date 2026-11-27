@@ -2,11 +2,27 @@
 
 Dynamic Bottle Liquids SE animates liquid inside Skyrim Special Edition bottles. Tilt or shake a supported bottle to see the liquid shift, form waves and carry bubbles to the surface.
 
-**Version 1.0.0** supports the Steam runtimes 1.5.97, 1.6.1170 and 1.7.104.
+**Version 1.1.0** supports the Steam runtimes 1.5.97, 1.6.1170 and 1.7.104.
 
 **[Download the mod and compatibility patches on Nexus Mods](https://www.nexusmods.com/games/skyrimspecialedition/mods/199666)**
 
 Install the runtime with the matching SKSE and Address Library. Install compatibility patches after DBL and the bottle replacers they target.
+
+The 1.1.0 core includes the vanilla bottle meshes based on Assorted Mesh Fixes. For vanilla bottles, leave **General Potion Replacers** on **Skip**. If you use RUSTIC ANIMATED POTIONS and POISONS, select it directly on that page.
+
+For Unified Potions PBR, XMead PBR Clear, or Destrier Wine PBR, rerun PG Patcher after installing the DBL patch. Give the DBL meshes priority among PG Patcher's inputs, then let the generated output overwrite the DBL patch.
+
+## What's new in 1.1.0
+
+- Reduced shadow and caustic preparation when the native renderer can verify which lights reach a bottle.
+- Refitted liquid cavities across supported bottle replacers, including TMD Winery, XMead, and ElSopa.
+- Corrected ElSopa and Xtudo no-emission variants and added moving liquid to the Zerofrost models for Esbern's Potion, Sleeping Tree Sap, and Soul Husk Extract.
+
+With Light Placer and CS Light or another configuration pack, choose **Emission** for ElSopa or Medieval Potions and **Original glow only** for Skyking. RUSTIC retains its original animated glow. Light placement depends on the enabled rules and the winning models.
+
+## Shader compatibility
+
+Reverse-Z detection was verified with Open Shaders 2.23.1 on Skyrim 1.6.1170 with InverseZ enabled.
 
 ## Skyrim VR
 
@@ -16,7 +32,7 @@ This fork builds a Skyrim VR version of DBL. AirWolf359 maintains it with the ag
 
 You need Skyrim VR 1.4.15, SKSEVR and the VR Address Library for SKSE Plugins.
 
-1. Install DBL and any compatibility patches from Nexus as usual. They supply the bottle assets, profiles and shaders the VR build uses.
+1. Install DBL and any compatibility patches from Nexus as usual, using the DBL version the VR release names (the first three parts of its version number). They supply the bottle assets, profiles and shaders the VR build uses.
 2. Install this fork's VR release over DBL, and let it overwrite the DLL. The release contains only the VR-specific files:
    - `SKSE/Plugins/SkyrimBottlePrototype.dll`
    - `SKSE/Plugins/SkyrimBottlePrototype/BottleVertexVR.cso`
@@ -31,6 +47,7 @@ The VR DLL loads only in Skyrim VR, and the Nexus SE/AE DLL doesn't load in VR. 
 - Refraction uses one scene snapshot per frame, shared by all bottles.
 - Late optical composition and the forward path haven't been ported to stereo yet, so every bottle is drawn directly. Scenes with many bottles may cost more than in SE or AE.
 - Profiles with blurred refraction (`refraction_mip`) don't have a per-eye blur yet.
+- These 1.1.0 effects assume a single view and are off in VR for now: bottle shadows and caustics cast onto other surfaces, the sun shadow mask on liquid, lighting borrowed from fitting meshes, the extra refraction pass through native glass shells, and TMD Winery's authored glass shell and reflections. Those bottles use their native glass instead.
 - The performance overlay hasn't been tested in VR.
 
 How the liquid looks depends on the bottle replacer's compatibility patch, as it does in SE and AE. For example, the Skyking Potent Potables patch deliberately draws opaque, textured liquid.
@@ -54,6 +71,8 @@ Install [SKSE Menu Framework 3](https://www.nexusmods.com/skyrimspecialedition/m
 All supported bottles, including compatibility patches, use half as many cavity trace steps as the original renderer at each distance. In one in-game test with 95 tracked bottles, the compact overlay measured 0.782 ms of CPU time and 1.733 ms of GPU time per frame for DBL. Bottle draws accounted for 1.574 ms and preparation for 0.159 ms. These averages cover 525 GPU samples in that scene.
 
 ## Building the runtime
+
+[Download the 1.1.0 source package from GitHub Releases](https://github.com/103Sakamoto/Dynamic-Bottle-Liquids-SE/releases/tag/v1.1.0).
 
 Use 64-bit MSVC with C++23, CMake 3.25 or newer, Git, and vcpkg. Configure with the vcpkg toolchain and build the Release configuration.
 

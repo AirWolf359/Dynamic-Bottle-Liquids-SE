@@ -13,7 +13,7 @@ struct NativeGlassOrder {
     bool active=false;
 
     template<class Draw>
-    bool Begin(ID3D11DeviceContext* ctx,Draw draw,UINT count,UINT start,INT base){
+    bool Begin(ID3D11DeviceContext* ctx,Draw draw,UINT count,UINT start,INT base,bool drawRear=true){
         ComPtr<ID3D11RasterizerState> state;ctx->RSGetState(&state);
         if(!state)return false; // D3D default already culls rear faces.
         D3D11_RASTERIZER_DESC desc{};state->GetDesc(&desc);
@@ -32,7 +32,11 @@ struct NativeGlassOrder {
             cache.push_back(entry);found=&cache.back();
         }
         original=state;front=found->front;context=ctx;
-        ctx->RSSetState(found->rear.Get());draw(ctx,count,start,base);ctx->RSSetState(original.Get());
+        if(drawRear){
+            ctx->RSSetState(found->rear.Get());
+            draw(ctx,count,start,base);
+            ctx->RSSetState(original.Get());
+        }
         active=true;return true;
     }
     template<class Draw>

@@ -4,7 +4,11 @@
 #include "core/SimulationTimings.h"
 #include <chrono>
 namespace dblui {
-enum class GPUStage {Prepare,Draw,Compose};
+enum class GPUStage {
+    Prepare,Draw,Compose,CausticDepthCopy,CausticReceiver,CausticTile,
+    MaskTextureCopy,ShellTransmission,TmdReflectionReplay,Count
+};
+inline constexpr unsigned gpuStages=static_cast<unsigned>(GPUStage::Count);
 enum class CPUStage {Hooks,Bottles,Compose,Housekeeping};
 struct FrameSummary {unsigned long long cpuFrames,gpuFrames,droppedFrames;double cpuAverage,gpuAverage;};
 FrameSummary ReadFrameSummary();
@@ -40,17 +44,44 @@ void AddSection(unsigned hits,unsigned rebuilds,float area,float depth);
 int BeginGPU(ID3D11DeviceContext*,GPUStage stage=GPUStage::Draw);
 void EndGPU(ID3D11DeviceContext*,int);
 struct GPUCost {ID3D11DeviceContext* context;int token;GPUCost(ID3D11DeviceContext* c,GPUStage s,bool measure=true):context(c),token(measure?BeginGPU(c,s):-1){}~GPUCost(){EndGPU(context,token);}};
+enum class TileEvent { Hit, OpticalBuild, FocusBuild, Fallback, Count };
 #ifdef DBL_VR_TIMING
 // Test builds: run the detailed timers without the overlay. Present logs the
 // summary and resets every window.
 void EnableLogTiming(double windowSeconds);
 #endif
 #ifdef DBL_FRAMEWORK_UI
+enum class ReceiverStage {MaskValidation,LightMatching};
+struct ReceiverTimingState {
+ bool sampled=false;
+ unsigned long long frames{},calls[2]{};
+ long long ticks[2]{};
+};
+extern ReceiverTimingState receiverTiming;
+struct ReceiverTimer {
+ ReceiverStage stage;
+ bool sampled;
+ unsigned epoch;
+ LARGE_INTEGER start{};
+ explicit ReceiverTimer(ReceiverStage stage):stage(stage),sampled(receiverTiming.sampled),epoch(cpuClock.epoch){
+     if(sampled)QueryPerformanceCounter(&start);
+ }
+ ~ReceiverTimer(){
+     if(!sampled||epoch!=cpuClock.epoch)return;
+     LARGE_INTEGER end{};
+     QueryPerformanceCounter(&end);
+     receiverTiming.ticks[unsigned(stage)]+=end.QuadPart-start.QuadPart;
+     ++receiverTiming.calls[unsigned(stage)];
+ }
+};
+void RecordTile(bool caustic,TileEvent event);
 void RegisterFramework();
 void LabelDraw(int token,const char* name,uintptr_t instance);
 #else
+inline void RecordTile(bool,TileEvent){}
 inline void LabelDraw(int,const char*,uintptr_t){}
 #endif
+int TraceSampleCap();
 void SetMode(bool full,bool compact);
 void Present(IDXGISwapChain*,unsigned instances,bool allowUnfocused=false);
 }

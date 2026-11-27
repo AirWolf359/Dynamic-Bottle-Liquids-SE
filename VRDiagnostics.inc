@@ -155,6 +155,8 @@ struct VRDiagnostics {
     // D3D11 switches the immediate context's draw entries between several
     // implementations in d3d11.dll as pipeline state changes (test 3). Hook each
     // implementation the first time the renderer's table points at it.
+    // DrawIndexed is left to upstream's RefreshIndexedDraw, which routes every
+    // switched implementation through draw().
     static constexpr int variants=8; // 0: immediate at install, 1: deferred, 2+: found later
     std::unordered_set<void*> hooked;int nextVariant[kMethods]{2,2,2,2,2,2};
     void Hook(const char* kind,Method method,void* target,int variant);
@@ -164,7 +166,7 @@ struct VRDiagnostics {
         auto** table=*reinterpret_cast<void***>(context);
         for(int m=0;m<kMethods;++m){
             void* target=table[slots[m]];
-            if(!counting&&m!=kDrawIndexed&&m!=kDrawIndexedInstanced)continue;
+            if(m==kDrawIndexed||(!counting&&m!=kDrawIndexedInstanced))continue;
             if(!target||hooked.contains(target))continue;
             if(nextVariant[m]>=variants){hooked.insert(target);SKSE::log::warn("[DBL-VR] {} entry {}: no detour slots left",methodNames[m],ModuleOf(target));continue;}
             Hook("immediate (switched)",Method(m),target,nextVariant[m]++);
@@ -173,8 +175,8 @@ struct VRDiagnostics {
     void Install(ID3D11Device* device,void** immediate);
 } vrDiagnostics;
 
-// One detour set per hooked implementation. The immediate DrawIndexed detour at
-// install is draw() in Plugin.cpp; every other implementation is hooked here.
+// One detour set per hooked implementation. DrawIndexed on the immediate context
+// goes through draw() in Plugin.cpp; the other methods are hooked here.
 template<int Variant> struct VRDrawHooks {
     using M=VRDiagnostics::Method;
     static inline void(STDMETHODCALLTYPE* drawIndexed)(ID3D11DeviceContext*,UINT,UINT,INT){};

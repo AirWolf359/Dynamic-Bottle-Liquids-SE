@@ -29,6 +29,18 @@ inline BubbleLimits DivideBubbleQuota(unsigned quota,BubbleLimits demand){
 }
 inline void AllocateSceneBubbles(std::vector<BubbleBudgetRequest>& requests){
     constexpr unsigned maximum=1280;
+    std::uint64_t requested=0;
+    for(const auto& r:requests){
+        requested+=std::uint64_t(r.demand.shaking)+r.demand.foam+r.demand.carbonation;
+        if(requested>maximum)break;
+    }
+    if(requested<=maximum){
+        for(auto& r:requests){
+            r.allocation=r.demand;
+            if(r.destination)*r.destination=r.allocation;
+        }
+        return;
+    }
     auto score=[](const BubbleBudgetRequest& r){
         double p=std::isfinite(r.pixels)?std::clamp(r.pixels,1.f,1024.f):1.f;
         double d=std::isfinite(r.distance)?std::max(0.f,r.distance):768.f;

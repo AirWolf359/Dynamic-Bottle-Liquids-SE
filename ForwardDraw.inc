@@ -1,10 +1,11 @@
 #include "CommunityLighting.inc"
+constexpr UINT sunShadowSlot=38;
 // Fallout's shared-scene forward resolve, deferred to Skyrim's verified HDR
 // boundary. Native constant buffers are mutable: retain GPU copies, not pointers.
 struct ForwardBindings {
     static constexpr UINT vsSlots[3]{1,2,12},psSlots[3]{1,2,10},textureSlots[4]{0,1,4,13},samplerSlots[5]{0,1,4,13,15};
     ComPtr<ID3D11Buffer> vertex,index,vsCB[3],psCB[3],csStrict,fog;UINT fogFirst{},fogCount{};UINT csFirst{},csCount{};
-    ComPtr<ID3D11ShaderResourceView> textures[4];ComPtr<ID3D11SamplerState> samplers[5];
+    ComPtr<ID3D11ShaderResourceView> textures[4],sunShadow;ComPtr<ID3D11SamplerState> samplers[5];
     UINT stride{},offset{},indexOffset{};DXGI_FORMAT indexFormat{};
     ComPtr<ID3D11DeviceContext1> extended;UINT vsFirst[3]{},vsCount[3]{},psFirst[3]{},psCount[3]{};
     void read(ID3D11DeviceContext* c,ID3D11DeviceContext1* known=nullptr,bool ownBottle=false){
@@ -26,6 +27,7 @@ struct ForwardBindings {
         }
         for(int i=0;i<(ownBottle?3:4);++i)c->PSGetShaderResources(textureSlots[i],1,textures[i].ReleaseAndGetAddressOf());
         for(int i=0;i<(ownBottle?3:5);++i)c->PSGetSamplers(samplerSlots[i],1,samplers[i].ReleaseAndGetAddressOf());
+        if(!ownBottle)c->PSGetShaderResources(sunShadowSlot,1,sunShadow.ReleaseAndGetAddressOf());
     }
     void bind(ID3D11DeviceContext* c,const ForwardBindings* previous=nullptr,bool replay=false)const{
         if(!previous||vertex!=previous->vertex||stride!=previous->stride||offset!=previous->offset){auto* v=vertex.Get();c->IASetVertexBuffers(0,1,&v,&stride,&offset);}
@@ -41,6 +43,7 @@ struct ForwardBindings {
         if(csStrict){auto* b=csStrict.Get();if(extended)extended->PSSetConstantBuffers1(3,1,&b,&csFirst,&csCount);else c->PSSetConstantBuffers(3,1,&b);}
         for(int i=0;i<4;++i)if(!previous||textures[i]!=previous->textures[i]){auto* t=textures[i].Get();c->PSSetShaderResources(textureSlots[i],1,&t);}
         for(int i=0;i<(replay?4:5);++i)if(!previous||samplers[i]!=previous->samplers[i]){auto* s=samplers[i].Get();c->PSSetSamplers(samplerSlots[i],1,&s);}
+        if(!previous||sunShadow!=previous->sunShadow){auto* mask=sunShadow.Get();c->PSSetShaderResources(sunShadowSlot,1,&mask);}
     }
 };
 #include "ForwardCapture.inc"
@@ -108,7 +111,7 @@ struct ForwardDraws {
     }
     void draw(ID3D11DeviceContext* c,DrawFn original,ID3D11RenderTargetView* target,
         ID3D11DepthStencilView* sceneDepth,ID3D11DepthStencilView* nearestDepth,ID3D11BlendState* opaque,ID3D11DepthStencilState* nearest,
-        const D3D11_VIEWPORT& viewport){
+        const D3D11_VIEWPORT& viewport,bool reverseTarget){
         CSLightingRestore csRestore(c,communityLighting.ready);
         OpticalState pipeline(c);ForwardBindings saved;saved.read(c);
         struct Restore {ID3D11DeviceContext* c;ForwardBindings& b;~Restore(){b.bind(c);}} restore{c,saved};
@@ -117,7 +120,8 @@ struct ForwardDraws {
         {
             lastPacked=packed;lastTransfers=packed?(used+ForwardCapture::perChunk-1)/ForwardCapture::perChunk:used*5;
             finishCapture(c);
-            if(!snapshot.capture(c,info,view,borrowSceneDepth))throw std::runtime_error("Forward final scene snapshot unavailable: "+snapshot.status);
+            if(!snapshot.capture(c,info,view,borrowSceneDepth,false,nullptr,reverseTarget))
+                throw std::runtime_error("Forward final scene snapshot unavailable: "+snapshot.status);
         }
         c->OMSetRenderTargets(1,&target,nearestDepth);c->OMSetBlendState(opaque,nullptr,~0u);c->OMSetDepthStencilState(nearest,0);
         c->RSSetViewports(1,&viewport);c->RSSetState(raster.Get());c->VSSetShader(vs.Get(),nullptr,0);c->PSSetShader(shader.Get(),nullptr,0);c->GSSetShader(nullptr,nullptr,0);

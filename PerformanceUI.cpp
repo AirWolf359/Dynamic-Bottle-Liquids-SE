@@ -16,6 +16,9 @@
 #include <spdlog/spdlog.h>
 namespace dblui {
 CPUClockState cpuClock;
+#ifdef DBL_FRAMEWORK_UI
+ReceiverTimingState receiverTiming;
+#endif
 using Microsoft::WRL::ComPtr;
 namespace {
 bool full=false,compact=false,failed=false;
@@ -41,8 +44,9 @@ BottleDetailSummary bottleDetails;
 unsigned epoch=0,skipped=0,invalid=0,gpuCount=0,updates=0,bubbles=0;
 double gpuSum=0,gpuMax=0; nuka::SimulationTimings sums{},peaks{};
 unsigned sectionHits=0,sectionBuilds=0;float sectionArea=0,sectionDepth=0;
+int traceSampleCap=48;
 #ifndef DBL_FRAMEWORK_UI
-std::array<bool,4> keys{};
+std::array<bool,5> keys{};
 auto last=std::chrono::steady_clock::now();
 #endif
 #ifdef DBL_FRAMEWORK_UI
@@ -50,6 +54,8 @@ void ResetAttribution();
 #endif
 void Reset(){cpuClock.ticks[0]=cpuClock.ticks[1]=cpuClock.ticks[2]=cpuClock.ticks[3]=0;++cpuClock.epoch;cpuClock.enabled=!failed&&(full||compact);CloseQueryFrame();++epoch;costs={};costs.sampleInterval=16;
 #ifdef DBL_FRAMEWORK_UI
+receiverTiming={};
+receiverTiming.sampled=cpuClock.enabled&&costs.Selected();
 ResetAttribution();
 #endif
 queryStats={};bottleDetails={};sums={};peaks={};gpuSum=gpuMax=0;gpuCount=updates=bubbles=skipped=invalid=0;sectionHits=sectionBuilds=0;}
@@ -95,7 +101,7 @@ void Poll(){for(auto& f:queryFrames){if(!f.pending||!f.closed)continue;
   }
 #endif
   costs.Resolve(s.frame,unsigned(s.stage),ms,true);
-  if(full&&s.stage==GPUStage::Draw){gpuSum+=ms;gpuMax=std::max(gpuMax,ms);++gpuCount;}
+    if(full&&s.stage==GPUStage::Draw){gpuSum+=ms;gpuMax=std::max(gpuMax,ms);++gpuCount;}
  }
  if(!outstanding){f.pending=f.closed=false;f.tokens.clear();}
 }}
@@ -110,6 +116,7 @@ void AddTier(unsigned tier){if(Extensive()&&tier<5)++bottleDetails.tiers[tier];}
 void AddResting(bool hit,double ms){if(!Extensive())return;if(hit)++bottleDetails.restHits;else ++bottleDetails.restBuilds;bottleDetails.restMs+=ms;}
 void AddCPU(CPUStage stage,double ms){if(Enabled())costs.CPU(unsigned(stage),ms);}
 bool Enabled(){return !failed&&(full||compact);}
+int TraceSampleCap(){return traceSampleCap;}
 bool Extensive(){return !failed&&full;}
 void AddSection(unsigned hits,unsigned rebuilds,float area,float depth){if(!Extensive())return;sectionHits+=hits;sectionBuilds+=rebuilds;sectionArea=area;sectionDepth=depth;}
 void SetMode(bool detailed,bool brief){full=detailed;compact=!detailed&&brief;Reset();spdlog::info("[DBL-diagnostics] mode={}",full?"extensive":compact?"simple":"off");}
@@ -146,6 +153,8 @@ void Present(IDXGISwapChain* swap,unsigned instances,bool allowUnfocused){
  if(Edge(VK_F7,0,focused)){full=!full;if(full)compact=false;Reset();}
  if(Edge(VK_F8,1,focused)){compact=!compact;if(compact)full=false;Reset();}
  if(Edge(VK_F9,2,focused))Reset();
+ if(Edge(VK_F10,3,focused))traceSampleCap=std::max(12,traceSampleCap-12);
+ if(Edge(VK_F11,4,focused))traceSampleCap=std::min(192,traceSampleCap+12);
  if(focused&&(GetAsyncKeyState(VK_ESCAPE)&0x8000)){full=false;compact=false;}
  cpuClock.enabled=Enabled();
  if(!ui&&!Enabled())return;
@@ -168,6 +177,7 @@ void Present(IDXGISwapChain* swap,unsigned instances,bool allowUnfocused){
  ImGui::Begin(full?"DBL - Performance diagnostics":"DBL - Performance",nullptr,flags);
  double sum=0;for(auto v:sums)sum+=v;
  double cpuTotal=0,gpuTotal=0;for(double v:costs.cpuSum)cpuTotal+=v;for(double v:costs.gpuSum)gpuTotal+=v;
+ ImGui::Text("Liquid trace cap: %d samples (Ctrl+F10 / Ctrl+F11)",traceSampleCap);
  ImGui::Text("CPU mod: %.3f ms/frame avg | %.3f peak",costs.cpuFrames?cpuTotal/costs.cpuFrames:0,costs.cpuMax);
  if(costs.Reliable())ImGui::Text("GPU elapsed: %.3f ms/sampled frame | %.3f sampled peak",gpuTotal/costs.gpuFrames,costs.gpuMax);else ImGui::TextUnformatted("GPU elapsed: insufficient samples (warming up, dropped or stale)");
  if(full){
@@ -175,9 +185,11 @@ void Present(IDXGISwapChain* swap,unsigned instances,bool allowUnfocused){
  ImGui::Text("CPU simulation: %.3f ms/update avg",updates?sum/updates:0);
  if(gpuCount&&costs.Reliable())ImGui::Text("GPU draw interval: %.3f ms/draw avg | %.3f peak",gpuSum/gpuCount,gpuMax);else ImGui::TextUnformatted("GPU draw interval: waiting for samples");
  const char* cpuNames[]={"Hook matching","Bottle CPU (includes simulation)","Late composition CPU","Housekeeping"};
- const char* gpuNames[]={"Preparation/copies","All bottle passes","Late composition/copies"};
+ constexpr const char* gpuNames[]={"Preparation/copies","All bottle passes","Late composition/copies","Caustic depth copy","Caustic receiver draw","Caustic tile preparation",
+   "Shadow mask texture copy","Shell transmission draw","TMD reflection replay"};
+ static_assert(std::size(gpuNames)==gpuStages);
  for(unsigned i=0;i<4;++i)ImGui::Text("CPU %s: %.3f ms/frame",cpuNames[i],costs.cpuFrames?costs.cpuSum[i]/costs.cpuFrames:0);
- if(costs.Reliable())for(unsigned i=0;i<3;++i)ImGui::Text("GPU %s: %.3f ms/frame",gpuNames[i],costs.gpuFrames?costs.gpuSum[i]/costs.gpuFrames:0);
+ if(costs.Reliable())for(unsigned i=0;i<gpuStages;++i)ImGui::Text("GPU %s: %.3f ms/frame",gpuNames[i],costs.gpuFrames?costs.gpuSum[i]/costs.gpuFrames:0);
  ImGui::Text("Complete sampled GPU frames: %llu | dropped: %llu",(unsigned long long)costs.gpuFrames,(unsigned long long)costs.droppedFrames);
  const char* detailNames[]={"State queries","Pose/constants","Optical setup","Buffer upload","Draw/restore"};
  for(unsigned i=0;i<5;++i)ImGui::Text("Bottle CPU %s: %.3f ms/frame",detailNames[i],costs.cpuFrames?bottleDetails.ms[i]/costs.cpuFrames:0);
