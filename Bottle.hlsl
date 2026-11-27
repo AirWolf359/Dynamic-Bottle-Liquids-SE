@@ -67,8 +67,19 @@ SamplerState RippleSampler : register(s13);
 Texture2D<float> SceneDepth : register(t14);
 Texture2D<float4> SceneColor : register(t15);
 SamplerState SceneSampler : register(s15);
+#ifdef DBL_VR
+// Skyrim VR: the fitting's world matrix and light positions are per eye, as in
+// NativeGeometry and SceneLighting. The single borrowed light is [eye*count].
+cbuffer FittingGeometry:register(b8){row_major float3x4 DonorWorldEyes[2];};
+cbuffer FittingLighting:register(b7){float4 DonorPositionEyes[14]:packoffset(c27);float4 DonorColor:packoffset(c41);float2 DonorCounts:packoffset(c48);};
+#define DBL_DONOR_WORLD DonorWorldEyes[p.eye]
+#define DBL_DONOR_POSITION DonorPositionEyes[p.eye*(uint)clamp((int)DonorCounts.x,0,7)]
+#else
 cbuffer FittingGeometry:register(b8){row_major float3x4 DonorWorld;};
 cbuffer FittingLighting:register(b7){float4 DonorChannel:packoffset(c2);float4 DonorPosition:packoffset(c15);float4 DonorColor:packoffset(c22);float2 DonorCounts:packoffset(c29);};
+#define DBL_DONOR_WORLD DonorWorld
+#define DBL_DONOR_POSITION DonorPosition
+#endif
 Texture2D<float4> SunShadowMask : register(t38);
 #endif
 cbuffer Bottle : register(b10) {
@@ -1049,18 +1060,18 @@ float4 PSMain(Pixel p) : SV_TARGET {
         uint2 cluster=0;if(useCS)cluster=csCluster(p.position);
         uint lightCount=useCS?min(CSStrictCount,15)+cluster.y:(uint)clamp((int)LightCounts.x,0,7);
         bool reflectionSource=FittingPosition.y>.5;
-        bool fromDraw=FittingColor.w!=0 && DonorPosition.w>0 &&
+        bool fromDraw=FittingColor.w!=0 && DBL_DONOR_POSITION.w>0 &&
             (reflectionSource ? DonorCounts.x>=1 && DonorCounts.y>=1 : DonorCounts.x==1);
         if(fromDraw && FittingPosition.x>0 && !useCS && lightCount==0){
             float3 offset=float3(FittingRows[0].w,FittingRows[1].w,FittingRows[2].w);
             float3 origin=p.world+mul(p.basis,offset-p.local);
             float3x3 expected=mul(p.basis,float3x3(FittingRows[0].xyz,FittingRows[1].xyz,FittingRows[2].xyz));
-            float3x3 diff=abs(expected-(float3x3)DonorWorld);
-            fromDraw=all(abs(origin-float3(DonorWorld[0].w,DonorWorld[1].w,DonorWorld[2].w))<.05)
+            float3x3 diff=abs(expected-(float3x3)DBL_DONOR_WORLD);
+            fromDraw=all(abs(origin-float3(DBL_DONOR_WORLD[0].w,DBL_DONOR_WORLD[1].w,DBL_DONOR_WORLD[2].w))<.05)
                 && all(max(diff[0],max(diff[1],diff[2]))<.002);
         }
         bool addDonor=!useCS && fromDraw && (reflectionSource||lightCount==0);
-        float4 donorPosition=DonorPosition;
+        float4 donorPosition=DBL_DONOR_POSITION;
         if(addDonor){
             if(FittingColor.w>0){
                 float4 pos=float4(donorPosition.xyz,1);
