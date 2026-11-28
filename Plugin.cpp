@@ -751,7 +751,16 @@ ComPtr<ID3D11ShaderResourceView> NativeSunShadow(ID3D11DeviceContext* ctx,bool f
     ComPtr<ID3D11ShaderResourceView> bound;
     ctx->PSGetShaderResources(14,1,&bound);
     if(fittingMask)bound=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV);
-    else if(bound.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV)){ReportShadowMask("Not used: the bottle's draw has no shadow mask at t14");return {};}
+    else if(vrStereo&&!bound){
+        // Skyrim VR leaves t14 empty for most bottle draws, and for every vanilla
+        // bottle. Attach the frame's mask when the draw targets the main view;
+        // other passes are rejected below.
+        ReportShadowMask("Attaching the shadow mask to bottle draws that have none at t14");
+        bound=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV);
+    }
+    else if(bound.Get()!=reinterpret_cast<ID3D11ShaderResourceView*>(mask.SRV)){
+        ReportShadowMask("Not used: the bottle's draw has another texture at t14");return {};
+    }
     ComPtr<ID3D11RenderTargetView> output;
     ctx->OMGetRenderTargets(1,&output,nullptr);
     if(!output)return {};
