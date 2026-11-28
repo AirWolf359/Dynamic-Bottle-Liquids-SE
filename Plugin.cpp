@@ -380,7 +380,7 @@ void initialize(ID3D11Device* device,const std::filesystem::path& shaderPath=roo
     D3D11_RASTERIZER_DESC r{}; r.FillMode=D3D11_FILL_SOLID; r.CullMode=D3D11_CULL_NONE; r.DepthClipEnable=true;
     check(device->CreateRasterizerState(&r,&raster));
     ComPtr<ID3DBlob> shellCode;
-    check(D3DReadFileToBlob((shaderPath.parent_path()/"TmdShellOptics.cso").c_str(),&shellCode));
+    check(D3DReadFileToBlob((shaderPath.parent_path()/(vrStereo?"TmdShellOpticsVR.cso":"TmdShellOptics.cso")).c_str(),&shellCode));
     check(device->CreatePixelShader(shellCode->GetBufferPointer(),shellCode->GetBufferSize(),nullptr,&shellOpticsPS));
     shellCode.Reset();
     check(D3DReadFileToBlob((shaderPath.parent_path()/"TmdShellCoverage.cso").c_str(),&shellCode));
@@ -593,6 +593,13 @@ void ReportShadowMask(const char* outcome){
     if constexpr(vrStereo){
         static std::unordered_set<std::string_view> reported;
         if(reported.emplace(outcome).second)SKSE::log::info("[DBL-VR-shadow] {}",outcome);
+    }
+}
+// Skyrim VR: log each shell refraction outcome once.
+void ReportShellRefraction(const std::string& outcome){
+    if constexpr(vrStereo){
+        static std::unordered_set<std::string> reported;
+        if(reported.emplace(outcome).second)SKSE::log::info("[DBL-VR-shell] {}",outcome);
     }
 }
 thread_local std::unordered_map<const RE::BSGeometry*,FittingSample> fittingSamples;
@@ -1549,6 +1556,20 @@ bool QueueTmdReflection(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base)
     }
     return captured||!visible;
 }
+// Native-glass bottles: redraw the image seen through the glass, bent by the
+// shell, before the native glass draws over it.
+void DrawNativeShellRefraction(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,const NativeGlassOrder& glassOrder){
+    if(!profile->nativeGlassPrototype||profile->shieldWetParticles||
+       (profile->visual.shellRefraction<=0&&profile->visual.straight<=0))return;
+    float weight=1;
+    if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->cameraRoot){
+        auto delta=camera->cameraRoot->world.translate-active->geometry->world.translate;
+        weight=distanceTuning.Weight(0,delta.Length());
+    }
+    if(glassOrder.active)ctx->RSSetState(glassOrder.front.Get());
+    const bool drawn=DrawShellTransmission(ctx,count,start,base,weight*profile->visual.shellRefraction,weight>0?profile->visual.straight:0);
+    if constexpr(vrStereo)if(drawn)ReportShellRefraction(std::format("Applied, first on {}",active->geometry->name.c_str()));
+}
 // Read a cork or fitting draw's lighting for its bottle (ElSopa, Skyking).
 __forceinline void CaptureFittingDraw(ID3D11DeviceContext* ctx,UINT count){
     if(!distanceTuning.renderer)return;
@@ -1576,8 +1597,9 @@ __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT
         }
     }
     if constexpr(vrStereo){
-        // TMD's authored shell and the shell refraction pass use one-view
-        // screen-space shaders, so VR draws those bottles' native glass instead.
+        // TMD's authored shell uses one-view screen-space shaders, so VR draws
+        // those bottles' native glass instead.
+        if(handled&&profile&&!profile->authoredGlass)DrawNativeShellRefraction(ctx,count,start,base,glassOrder);
         if(glassOrder.active)glassOrder.Finish(DrawNativeBottleGlass,count,start,base);
         else if(!handled||(profile&&(profile->nativeGlassPrototype||profile->authoredGlass)))DrawNativeBottleGlass(ctx,count,start,base);
         return;
@@ -1592,16 +1614,7 @@ __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT
         tmdReflections.DrawPending(ctx,target.Get(),active->geometry,profile->visual.surface.z>-1.f);
         return;
     }
-    if(handled&&profile&&profile->nativeGlassPrototype&&!profile->shieldWetParticles&&
-       (profile->visual.shellRefraction>0||profile->visual.straight>0)){
-        float weight=1;
-        if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->cameraRoot){
-            auto delta=camera->cameraRoot->world.translate-active->geometry->world.translate;
-            weight=distanceTuning.Weight(0,delta.Length());
-        }
-        if(glassOrder.active)ctx->RSSetState(glassOrder.front.Get());
-        DrawShellTransmission(ctx,count,start,base,weight*profile->visual.shellRefraction,weight>0?profile->visual.straight:0);
-    }
+    if(handled&&profile)DrawNativeShellRefraction(ctx,count,start,base,glassOrder);
     if(glassOrder.active)glassOrder.Finish(DrawNativeBottleGlass,count,start,base);
     else if(!handled||(profile&&profile->nativeGlassPrototype)){
         // Fitting capture verifies the engine's original mask. Substitute the
@@ -1911,7 +1924,7 @@ void ValidateBottleCoverage(){
 }
 #ifdef DBL_SKYRIM_VR
 // VR fork: upstream release (1.1.0) plus the VR build number.
-constexpr REL::Version releaseVersion{1,1,0,1};
+constexpr REL::Version releaseVersion{1,1,0,2};
 #else
 constexpr REL::Version releaseVersion{1,1,0,0};
 #endif
