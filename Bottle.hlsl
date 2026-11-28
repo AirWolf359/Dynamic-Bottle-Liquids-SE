@@ -25,6 +25,7 @@ cbuffer SceneMaterial : register(b1) { float4 EnvironmentData : packoffset(c2); 
 cbuffer SceneLighting : register(b2) {
     float3 LightDirection : packoffset(c0);
     float3 LightColor : packoffset(c13);
+    float4 NativeShadowChannel : packoffset(c14); // ShadowLightMaskSelect
     float4 MaterialData : packoffset(c15);
     row_major float3x4 Ambient : packoffset(c23);
     float4 LightPositionsEyes[14] : packoffset(c27);
@@ -32,9 +33,6 @@ cbuffer SceneLighting : register(b2) {
     float2 LightCounts : packoffset(c48);
 };
 #define DBL_LIGHT_POSITION(i) LightPositionsEyes[p.eye*(uint)clamp((int)LightCounts.x,0,7)+(i)]
-// The native screen shadow mask (textureFlags 16/32) isn't used in VR yet, and
-// the VR layout of its channel field hasn't been mapped. Never read engine data for it.
-static const float4 NativeShadowChannel=0;
 #else
 cbuffer SceneLighting : register(b2) {
     float3 LightDirection : packoffset(c0);
