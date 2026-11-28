@@ -56,6 +56,7 @@ jobs += [
     ('Bottle', 'BottleVertexVR', 'VSMain', 'vs_5_0', ['DBL_VERTEX', 'DBL_VR']),
     ('Bottle', 'BottleImmediateVR', 'PSMain', 'ps_5_0', ['DBL_VR']),
     ('Bottle', 'BottleNativeLiquidVR', 'PSMain', 'ps_5_0', ['DBL_NATIVE_GLASS', 'DBL_VR']),
+    ('TmdShellOptics', 'TmdShellOpticsVR', 'main', 'ps_5_0', ['DBL_VR']),
 ]
 
 

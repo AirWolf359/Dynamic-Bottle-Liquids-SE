@@ -1,17 +1,21 @@
 
 // Replace only the transmitted image. The native material draws its lit color
 // over this image using the menu coverage immediately afterwards.
-void DrawShellTransmission(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,float bend,int mip){
-    if(bend<=0&&mip<=0)return;
+bool DrawShellTransmission(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,float bend,int mip){
+    if(bend<=0&&mip<=0)return false;
     static SceneSnapshot snapshot;
     V4 info{},area{};
     ComPtr<ID3D11RenderTargetView> target;
     ctx->OMGetRenderTargets(1,&target,nullptr);
     RefractionCamera refractionCamera;
-    if(IsMainSceneTarget(target.Get()))refractionCamera.read(ctx);
+    // The refraction camera reads one view's constants, so VR doesn't use it.
+    if(!vrStereo&&IsMainSceneTarget(target.Get()))refractionCamera.read(ctx);
     const auto* camera=refractionCamera.camera.buffer?&refractionCamera:nullptr;
-    try{if(!snapshot.capture(ctx,info,area,false,true,camera))return;}
-    catch(const std::exception& e){static bool logged=false;if(!logged){SKSE::log::warn("Shell refraction unavailable: {}",e.what());logged=true;}return;}
+    try{if(!snapshot.capture(ctx,info,area,false,true,camera)){
+        if constexpr(vrStereo)ReportShellRefraction(std::format("Not applied: {}",snapshot.status));
+        return false;
+    }}
+    catch(const std::exception& e){static bool logged=false;if(!logged){SKSE::log::warn("Shell refraction unavailable: {}",e.what());logged=true;}return false;}
     if(mip>0){
         snapshot.blur.invalidate();
         try{snapshot.blur.buildUnsafe(ctx,snapshot.colorView.Get(),snapshot.sampledDepth(),snapshot.color.Get(),snapshot.width,snapshot.height,
@@ -47,4 +51,5 @@ void DrawShellTransmission(ID3D11DeviceContext* ctx,UINT count,UINT start,INT ba
     ctx->VSSetShader(oldVS.Get(),nullptr,0);ctx->PSSetShader(oldPS.Get(),nullptr,0);ctx->IASetInputLayout(oldLayout.Get());
     ctx->OMSetDepthStencilState(oldDepth.Get(),stencil);ctx->OMSetBlendState(oldBlend.Get(),factors,mask);
     ctx->OMSetRenderTargets(8,targets,z.Get());for(auto* target:targets)if(target)target->Release();
+    return true;
 }

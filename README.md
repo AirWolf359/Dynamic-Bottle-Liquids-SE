@@ -38,16 +38,17 @@ You need Skyrim VR 1.4.15, SKSEVR and the VR Address Library for SKSE Plugins.
    - `SKSE/Plugins/SkyrimBottlePrototype/BottleVertexVR.cso`
    - `SKSE/Plugins/SkyrimBottlePrototype/BottleImmediateVR.cso`
    - `SKSE/Plugins/SkyrimBottlePrototype/BottleNativeLiquidVR.cso`
+   - `SKSE/Plugins/SkyrimBottlePrototype/TmdShellOpticsVR.cso`
 
 The VR DLL loads only in Skyrim VR, and the Nexus SE/AE DLL doesn't load in VR. The log is written to `Documents/My Games/Skyrim VR/SKSE/Dynamic Bottle Liquids SE.log`.
 
 ### Differences in VR
 
 - Liquid, waves, bubbles and refraction render in both eyes using Skyrim VR's instanced stereo.
-- Refraction uses one scene snapshot per frame, shared by all bottles.
+- Liquid refraction uses one scene snapshot per frame, shared by all bottles. The shell refraction pass through native glass (TMD Winery by default) takes its own snapshot per bottle, after the liquid is drawn.
 - Late optical composition and the forward path haven't been ported to stereo yet, so every bottle is drawn directly. Scenes with many bottles may cost more than in SE or AE.
 - Profiles with blurred refraction (`refraction_mip`) don't have a per-eye blur yet.
-- These 1.1.0 effects assume a single view and are off in VR for now: bottle shadows and caustics cast onto other surfaces, the extra refraction pass through native glass shells, and TMD Winery's authored glass shell and reflections. Those bottles use their native glass instead.
+- These 1.1.0 effects assume a single view and are off in VR for now: bottle shadows and caustics cast onto other surfaces, and TMD Winery's authored glass shell and reflections. Those bottles use their native glass instead.
 - The performance overlay hasn't been tested in VR.
 
 How the liquid looks depends on the bottle replacer's compatibility patch, as it does in SE and AE. For example, the Skyking Potent Potables patch deliberately draws opaque, textured liquid.
