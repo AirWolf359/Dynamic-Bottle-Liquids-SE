@@ -1060,6 +1060,7 @@ struct InstancedCall{DrawInstancedFn original;UINT instances,startInstance;};
 thread_local const InstancedCall* instancedCall=nullptr;
 void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original);
 void CaptureVRFittingDraw(ID3D11DeviceContext* ctx,UINT count);
+bool DrawTmdInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original);
 bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassOrder& glassOrder) {
     if(!distanceTuning.renderer||!active||!profile)return false;
     auto* g=active->geometry;
@@ -1331,11 +1332,12 @@ bool render(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base,NativeGlassO
     if(profile->nativeGlassPrototype&&captured&&native.csStrict&&communityLighting.liveBindingsReady(ctx))gpu.eye.w=float(unsigned(gpu.eye.w)|4u);
     const FittingSample* fitting=nullptr;
     bool reflectionShadowed=false;
-    // VR: TMD's reflection lighting and bottle projection assume one view, so they
-    // stay off in the stereo build. The screen shadow mask is double-wide like the
-    // main target, so each eye's pixels already address their own half.
-    const NativeConstantSlice* reflectionLighting=!vrStereo&&profile->authoredGlass?
-        tmdReflections.Lighting(ctx,g,&reflectionShadowed):nullptr;
+    // VR: bottle projection assumes one view, so it stays off in the stereo build.
+    // The screen shadow mask is double-wide like the main target, so each eye's
+    // pixels already address their own half. TMD's reflection lighting is read at
+    // VR's per-eye light layout (fittingLightingRegisters).
+    const NativeConstantSlice* reflectionLighting=profile->authoredGlass?
+        tmdReflections.Lighting(ctx,g,&reflectionShadowed,fittingLightingRegisters):nullptr;
     const NativeConstantSlice* borrowedLight=nullptr;
     if(worldDistance&&effectWeights[13]>0){
         auto* player=RE::PlayerCharacter::GetSingleton();
@@ -1544,8 +1546,10 @@ bool QueueTmdReflection(ID3D11DeviceContext* ctx,UINT count,UINT start,INT base)
     const bool reverseDepth=IsNativeGlassColorPass(ctx)&&UsesBottledWorldGlassDepth(ctx);
     BottleGlassDepthRequest depthRequest(ctx);
     if(reverseDepth)depthRequest.normalize();
+    const UINT replayInstances=instancedCall?instancedCall->instances:1,replayStart=instancedCall?instancedCall->startInstance:0;
     const bool captured=tmdReflections.Capture(ctx,body,target,oldDraw,count,start,base,
-                                  reinterpret_cast<ID3D11ShaderResourceView*>(shadowMask),visible,reverseDepth);
+                                  reinterpret_cast<ID3D11ShaderResourceView*>(shadowMask),visible,reverseDepth,
+                                  replayInstances,replayStart);
 #ifdef DBL_DEVELOPMENT
     TraceJessica(body,captured?"reflection-queued":"reflection-pass-through",ctx,count);
 #endif
@@ -1596,14 +1600,6 @@ __forceinline void DrawBottle(ID3D11DeviceContext* ctx,UINT count,UINT start,INT
             handled=TryRenderBottle(ctx,count,start,base,glassOrder);
         }
     }
-    if constexpr(vrStereo){
-        // TMD's authored shell uses one-view screen-space shaders, so VR draws
-        // those bottles' native glass instead.
-        if(handled&&profile&&!profile->authoredGlass)DrawNativeShellRefraction(ctx,count,start,base,glassOrder);
-        if(glassOrder.active)glassOrder.Finish(DrawNativeBottleGlass,count,start,base);
-        else if(!handled||(profile&&(profile->nativeGlassPrototype||profile->authoredGlass)))DrawNativeBottleGlass(ctx,count,start,base);
-        return;
-    }
     if(handled&&profile&&profile->authoredGlass){
         if(glassOrder.active)glassOrder.Finish(DrawAuthoredBottleGlass,count,start,base);
         else DrawAuthoredBottleGlass(ctx,count,start,base);
@@ -1653,6 +1649,29 @@ void DrawBottleInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT
     const InstancedCall call{original,instances,startInstance};instancedCall=&call;
     DrawBottle(ctx,count,start,base);
     instancedCall=previous;
+}
+// Skyrim VR: the draws SE's hook handles before DrawBottle, for meshes without a
+// profile of their own. TMD's "Reflection" mesh is recorded and replayed after
+// its body's authored glass; a shielded bottle's glass shell gets its coverage.
+// Returns false when the draw should go to the engine unchanged.
+bool DrawTmdInstanced(ID3D11DeviceContext* ctx,UINT count,UINT instances,UINT start,INT base,UINT startInstance,DrawInstancedFn original){
+    if(!tmdReflectionBody&&shellCoverage<0)return false;
+    dblui::CPUCost cpuCost(dblui::CPUStage::Bottles);
+    const InstancedCall* previous=instancedCall;
+    const InstancedCall call{original,instances,startInstance};instancedCall=&call;
+    bool drawn=false;
+    if(tmdReflectionBody){
+        try{drawn=QueueTmdReflection(ctx,count,start,base);}
+        catch(const std::exception& e){
+            static bool reported=false;
+            if(!reported){reported=true;SKSE::log::warn("[DBL-TMD-reflection] Native draw fallback: {}",e.what());}
+        }
+        static bool reportedVR=false;
+        if(drawn&&!reportedVR){reportedVR=true;SKSE::log::info("[DBL-VR-tmd] Reflection replay active, first on {}",tmdReflectionBody->name.c_str());}
+    }
+    if(!drawn&&shellCoverage>=0)drawn=DrawTmdShell(ctx,count,start,base);
+    instancedCall=previous;
+    return drawn;
 }
 void* IndexedDrawEntry(ID3D11DeviceContext* context){
     return (*reinterpret_cast<void***>(context))[12];

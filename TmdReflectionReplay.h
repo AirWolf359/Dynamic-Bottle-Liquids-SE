@@ -82,12 +82,14 @@ class TmdReflectionReplay {
 public:
     explicit TmdReflectionReplay(Execute execute=ExecuteNormally):execute(execute){}
 
+    // registers: the lighting registers the borrowed light needs (30 in SE/AE,
+    // 49 in Skyrim VR, whose point-light positions are per eye).
     const NativeConstantSlice* Lighting(ID3D11DeviceContext* immediate,const void* bottle,
-                                        bool* shadowMaskBound=nullptr) const {
+                                        bool* shadowMaskBound=nullptr,UINT registers=30) const {
         if(context.Get()!=immediate)return nullptr;
         for(size_t i=0;i<used;++i){
             const auto& entry=entries[i];
-            if(entry.commands&&entry.bottle==bottle&&entry.lighting.Contains(30)){
+            if(entry.commands&&entry.bottle==bottle&&entry.lighting.Contains(registers)){
                 if(shadowMaskBound)*shadowMaskBound=entry.shadowMaskBound;
                 return &entry.lighting;
             }
@@ -97,7 +99,7 @@ public:
 
     bool Capture(ID3D11DeviceContext* immediate,const void* bottle,ID3D11Resource* scene,
                  Draw draw,UINT count,UINT start,INT base,ID3D11ShaderResourceView* sceneShadowMask=nullptr,
-                 bool visible=true,bool reverseDepth=false){
+                 bool visible=true,bool reverseDepth=false,UINT instances=1,UINT startInstance=0){
         using Microsoft::WRL::ComPtr;
         if(!scene||recording||immediate->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
         ComPtr<ID3D11BlendState> blend;
@@ -251,7 +253,9 @@ public:
         deferred->VSSetShader(vertexShader.Get(),nullptr,0);
         deferred->PSSetShader(pixelShader.Get(),nullptr,0);
         recording=true;
-        deferred->DrawIndexed(count,start,base);
+        // Skyrim VR records the draw with its two-eye instancing.
+        if(instances>1)deferred->DrawIndexedInstanced(count,instances,start,base,startInstance);
+        else deferred->DrawIndexed(count,start,base);
         recording=false;
         if(FAILED(deferred->FinishCommandList(FALSE,entry.commands.ReleaseAndGetAddressOf())))return false;
 

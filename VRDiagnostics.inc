@@ -194,6 +194,8 @@ template<int Variant> struct VRDrawHooks {
         vrDiagnostics.Observe(c,M::kDrawIndexedInstanced,n,i,_ReturnAddress());
         if constexpr(Variant!=1)if(vrStereo&&!instancedCall){
             if(active&&profile){DrawBottleInstanced(c,n,i,s,b,si,drawIndexedInstanced);return;}
+            // TMD's reflection mesh and shielded glass shells (DrawTmdInstanced).
+            if(DrawTmdInstanced(c,n,i,s,b,si,drawIndexedInstanced))return;
             // A cork or fitting's draw: read its lighting for the bottle, then draw it as is.
             CaptureVRFittingDraw(c,n);
         }
