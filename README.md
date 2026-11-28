@@ -47,7 +47,7 @@ The VR DLL loads only in Skyrim VR, and the Nexus SE/AE DLL doesn't load in VR. 
 - Refraction uses one scene snapshot per frame, shared by all bottles.
 - Late optical composition and the forward path haven't been ported to stereo yet, so every bottle is drawn directly. Scenes with many bottles may cost more than in SE or AE.
 - Profiles with blurred refraction (`refraction_mip`) don't have a per-eye blur yet.
-- These 1.1.0 effects assume a single view and are off in VR for now: bottle shadows and caustics cast onto other surfaces, the sun shadow mask on liquid, lighting borrowed from fitting meshes, the extra refraction pass through native glass shells, and TMD Winery's authored glass shell and reflections. Those bottles use their native glass instead.
+- These 1.1.0 effects assume a single view and are off in VR for now: bottle shadows and caustics cast onto other surfaces, the sun shadow mask on liquid, the extra refraction pass through native glass shells, and TMD Winery's authored glass shell and reflections. Those bottles use their native glass instead.
 - The performance overlay hasn't been tested in VR.
 
 How the liquid looks depends on the bottle replacer's compatibility patch, as it does in SE and AE. For example, the Skyking Potent Potables patch deliberately draws opaque, textured liquid.

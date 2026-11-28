@@ -192,7 +192,11 @@ template<int Variant> struct VRDrawHooks {
     // through the context's current table, which would re-enter the renderer (VR test 6).
     static void STDMETHODCALLTYPE DrawIndexedInstanced(ID3D11DeviceContext* c,UINT n,UINT i,UINT s,INT b,UINT si){
         vrDiagnostics.Observe(c,M::kDrawIndexedInstanced,n,i,_ReturnAddress());
-        if constexpr(Variant!=1)if(vrStereo&&active&&profile&&!instancedCall){DrawBottleInstanced(c,n,i,s,b,si,drawIndexedInstanced);return;}
+        if constexpr(Variant!=1)if(vrStereo&&!instancedCall){
+            if(active&&profile){DrawBottleInstanced(c,n,i,s,b,si,drawIndexedInstanced);return;}
+            // A cork or fitting's draw: read its lighting for the bottle, then draw it as is.
+            CaptureVRFittingDraw(c,n);
+        }
         drawIndexedInstanced(c,n,i,s,b,si);
     }
     static void STDMETHODCALLTYPE DrawInstanced(ID3D11DeviceContext* c,UINT n,UINT i,UINT s,UINT si){vrDiagnostics.Observe(c,M::kDrawInstanced,n,i,_ReturnAddress());drawInstanced(c,n,i,s,si);}
